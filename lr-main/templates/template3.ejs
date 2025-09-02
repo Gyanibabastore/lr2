@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>A.V. Logistics - Consignment Receipt (A4)</title>
+  <style>
+    /* Page sizing for accurate A4 PDF output */
+    @page { size: A4; margin: 10mm; }
+    html,body{
+      height:297mm; /* A4 height */
+      margin:0;
+      font-family: Arial, Helvetica, sans-serif;
+      background: white;
+      -webkit-print-color-adjust: exact;
+    }
+
+    .sheet{
+      width:210mm; /* A4 width */
+      min-height:297mm;
+      padding:12mm 12mm;
+      box-sizing:border-box;
+    }
+
+    .header{
+      text-align:center;
+      margin-top:4mm;
+      margin-bottom:6mm;
+    }
+    .company-title{
+      font-family: 'Times New Roman', Times, serif;
+      font-size:28px;
+      color:#c40000;
+      letter-spacing:1px;
+      font-weight:700;
+    }
+
+    /* Top logo area (wing emblem on right) */
+    .top-row{ display:flex; justify-content:space-between; align-items:center; }
+    .logo-right{
+      width:110px; height:40px; position:relative; margin-right:6mm;
+    }
+    /* Simple wing emblem made with CSS */
+    .emblem{
+      position:relative; width:100%; height:100%;
+    }
+    .emblem .circle{ width:36px; height:36px; border-radius:50%; border:2px solid #222; display:inline-block; background:#fff; position:absolute; right:0; top:2px; text-align:center; line-height:36px; font-size:11px; font-weight:700; }
+    .wing{
+      position:absolute; height:26px; top:7px; left:0; right:48px; border-top:2px solid #222; border-bottom:2px solid #222; border-radius:50px; transform-origin:left center; opacity:0.95;
+    }
+
+    /* Outer framed receipt */
+    .receipt-wrap{ border:3px solid #111; padding:12px; margin-top:6mm; }
+    .receipt-inner{ border:1px solid #111; padding:8px; }
+
+    .top-grid{ display:flex; gap:12px; }
+    .box{ flex:1; border:1px solid #111; padding:8px; font-size:11px; }
+    .box h4{ margin:0 0 6px 0; font-size:12px; text-transform:uppercase; }
+    .note{ font-size:10px; line-height:1.0; }
+
+    /* Main details table */
+    table.details{ width:100%; border-collapse:collapse; margin-top:8px; font-size:12px; }
+    table.details td, table.details th{ border:1px solid #111; padding:6px; }
+    table.details th{ background:#f9f9f9; text-align:left; font-weight:700; }
+
+    .small-muted{ font-size:10px; color:#333; }
+
+    /* Footer small note */
+    .footer-note{ margin-top:8px; font-size:11px; }
+
+    /* Make sure printing matches on PDF */
+    @media print{
+      html,body { width:210mm; height:297mm; }
+      .sheet { box-shadow:none; margin:0; }
+    }
+
+  </style>
+</head>
+<body>
+  <div class="sheet">
+    <div class="header top-row">
+      <div></div>
+      <div class="company-title">A.V.LOGISTICS</div>
+      <div class="logo-right">
+    <div class="logo-right">
+  <img src="https://i.ibb.co/twdQjjK0/av-logo.jpg" alt="Company Logo" style="width:100%; height:auto;">
+</div>
+      </div>
+    </div>
+
+    <div class="receipt-wrap">
+      <div class="receipt-inner">
+
+        <div class="top-grid">
+          <div class="box">
+            <h4>AT OWNER'S RISK</h4>
+            <p class="note"><strong>SCHEDULE OF DEMURRAGE CHARGES</strong><br>
+            Demurrage chargable after......days from @Rs......per.......day per on weight Charged</p>
+          </div>
+
+          <div class="box">
+            <h4>CRUTION</h4>
+            <p class="note">This consignment will not be Detained,diverted re-routed re booked without consigne Bank's Written Permission.<br><small class="small-muted">NOTE: The consignment coverby this lorry Receipt be stored at the destination under the control of transport operator and will be detined of the order of the consignee bank whose Name Mentioned to the lorry recept it will under no Circumstance be derived to anyone withoutthe authority.</small></p>
+          </div>
+
+          <div class="box">
+            <h4>INSURANCE</h4>
+            <p class="note">The customer has Stated that:<br>—He has not intructed the consignment<br>—He has instructed the consignment Company......Policy No........Amount.....Risk</p>
+          </div>
+        </div>
+
+        <!-- Main table with fields similar to image -->
+        <table class="details" style="margin-top:10px;">
+          <tr>
+            <th style="width:12%">GR.NO</th>
+            <td style="width:28%"> </td>
+            <th style="width:12%">DATE</th>
+            <td style="width:48%"><%=date %>  <%=time%></td>
+          </tr>
+
+          <tr>
+            <th>Truck No.</th>
+            <td><%=truckNumber%></td>
+            <th>Actual Wt</th>
+            <td> <%= weight %></td>
+          </tr>
+
+          <tr>
+            <th>Consignor</th>
+            <td> </td>
+            <th>Packing Mode</th>
+            <td>LOOSE</td>
+          </tr>
+
+          <tr>
+            <th>Consignee</th>
+            <td> </td>
+            <th>Contains</th>
+            <td><%= description %></td>
+          </tr>
+
+          <tr>
+            <th>Invoice No :</th>
+            <td> </td>
+            <th>INV.AMOUNT :</th>
+            <td> </td>
+          </tr>
+
+          <tr>
+            <th>Ewaybill</th>
+            <td> </td>
+            <th>Frt.Amt</th>
+            <td style="text-align:right; font-weight:700;"></td>
+          </tr>
+
+          <tr>
+            <th>For :</th>
+            <td colspan="3"></td>
+          </tr>
+
+        </table>
+
+        <p class="footer-note"><strong>Note :</strong> No Responsibility for Leakage &amp; Breakage Company Is Not Responsibility For Re Booking.</p>
+
+      </div>
+    </div>
+
+  </div>
+</body>
+

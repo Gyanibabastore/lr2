@@ -1,0 +1,301 @@
+<!doctype html> 
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Namaskarm Road Lines - LR</title>
+<style>
+  :root{
+    --paper-w: 1000px; /* Width in pixels for screen view */
+    --paper-h: 148.5; /* Half of A4 height */
+    
+    --border-color:  black;
+  }
+
+  body{
+    font-family: Arial, Helvetica, sans-serif;
+    background: #f6f6f6;
+    padding: 24px;
+    display: flex;
+    justify-content: center;
+  }
+
+  .lr-sheet{
+    width: var(--paper-w);
+    height: var(--paper-h);
+    background: #fff;
+    
+    padding: 10px;
+    box-sizing: border-box;
+  }
+
+  .lr-inner {
+    border: 2px solid var(--border-color);
+    padding: 10px;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+  }
+
+  header {
+    display: grid;
+    grid-template-columns: 160px 1fr;
+    gap: 12px;
+    align-items: center;
+    margin-bottom: 8px;
+ background-color: #f4ecdc;
+  }
+   
+  .logo {
+    border: 1px solid #bbb;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #fff;
+  }
+  .logo img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+  .title {
+    text-align: center;
+    font-weight: 900;
+    letter-spacing: 2px;
+    color: #002647;
+  }
+  .title h1{
+    margin:0;
+    font-size:36px;
+  }
+  .title h2{
+    margin:0;
+    font-size:36px;
+    line-height:0.95;
+  }
+
+  .top-table {
+    width:100%;
+    border-collapse: collapse;
+    margin-top:5px;
+  }
+  .top-table td{
+    border:1px solid var(--border-color);
+    padding:4px 6px;
+    vertical-align: middle;
+    font-size:12px;
+  }
+  .top-table .label {
+    width:110px;
+    font-weight:700;
+    background:#fff;
+  }
+  .top-table .big{
+    font-size:14px;
+    font-weight:700;
+  }
+
+  .goods {
+    width:100%;
+    border-collapse: collapse;
+    margin-top:5px;
+  }
+  .goods th, .goods td {
+    border:1px solid var(--border-color);
+    padding:6px;
+    text-align:left;
+    vertical-align:top;
+    font-size:12px;
+  }
+  .goods th{
+    font-weight:700;
+    background: #fff;
+    text-align:center;
+  }
+  .goods .wt {
+    text-align:center;
+    font-weight:700;
+    font-size:16px;
+  }
+
+  .below-table {
+    margin-top:4px;
+    display:grid;
+    grid-template-columns: 1fr 200px;
+    gap:6px;
+  }
+  .below-table .box {
+    border:1px solid var(--border-color);
+    padding:4px;
+    min-height:34px;
+    font-size:12px;
+  }
+
+  .foot-row {
+    display:flex;
+    gap:6px;
+    margin-top:4px;
+  }
+  .foot-row .box {
+    border:1px solid var(--border-color);
+    padding:4px;
+    flex:1;
+    font-size:12px;
+  }
+  .signature {
+    width:180px;
+    border:1px solid var(--border-color);
+    padding:10px;
+    text-align:center;
+    font-weight:700;
+    font-size:12px;
+  }
+
+  .note {
+    margin-top:4px;
+    font-weight:700;
+    text-transform:capitalize;
+    border-top:2px solid var(--border-color);
+    padding-top:4px;
+    font-size:10px;
+  }
+
+  .center { text-align:center; }
+  .right { text-align:right; }
+
+  @media print{
+    body{ background: #fff; padding:0; }
+    .lr-sheet{ border-width:4px; box-shadow:none; width:100%; height: var(--paper-h); }
+  }
+
+  @media (max-width: 900px){
+    :root { --paper-w: 95vw; }
+    header { grid-template-columns: 120px 1fr; }
+    .title h1{ font-size:36px; }
+    .title h2{ font-size:26px; }
+  }
+</style>
+</head>
+<body>
+  <div class="lr-sheet">
+    <div class="lr-inner">
+
+      <header>
+        <div class="logo">
+          <img src="https://i.ibb.co/pvRknFhk/namaskarm-logo.jpg" alt="logo">
+        </div>
+        <div class="title">
+          <h1>NAMASKARM ROAD LINES</h1>
+        
+        </div>
+      </header>
+
+      <table class="top-table">
+        <tr>
+          <td class="label">From :</td>
+          <td></td>
+          <td class="label">To :</td>
+          <td></td>
+          <td class="label">Date / Time :</td>
+          <td class="big"><%= date %> <%= time %></td>
+          <td></td>
+        </tr>
+        <tr>
+          <td class="label">Truck No. :</td>
+          <td class="big"><%= truckNumber %></td>
+          <td class="label">Delivery :</td>
+          <td class="big">   </td>
+           <td class="label">Fright By :</td>
+          
+        </tr>
+        <tr>
+          <td class="label">Consignee :</td>
+          <td colspan="5"></td>
+        </tr>
+        <tr>
+          <td class="label">Consignor :</td>
+          <td colspan="2"></td>
+          <td class="label">GST No. :</td>
+          <td colspan="2"></td>
+        </tr>
+        <tr>
+          <td class="label">Address :</td>
+          <td colspan="5"></td>
+        </tr>
+      </table>
+
+      <table class="goods">
+        <thead>
+          <tr>
+            <th style="width:60px">No. Of Art.</th>
+            <th style="width:140px">Package Mode</th>
+            <th>Goods Contain</th>
+            <th style="width:90px">Wt.</th>
+            <th style="width:90px">Rate</th>
+            <th style="width:160px">Particulars</th>
+            <th style="width:90px">Amount</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td rowspan="3"></td>
+            <td>Loose</td>
+            <td><%= description %></td>
+            <td class="wt"><%= weight %></td>
+            <td rowspan="3"></td>
+            <td rowspan="3">
+              <strong>Freight</strong><br>
+              B.C.<br>
+              Loading<br>
+              Cartage Unloading<br>
+              GST 5%
+            </td>
+            <td rowspan="3"></td>
+          </tr>
+          <tr><td colspan="2"></td></tr>
+          <tr><td colspan="2"></td></tr>
+          <tr>
+            <td colspan="6" class="right"><strong>TOTAL</strong></td>
+            <td></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="below-table">
+        <div class="box">
+          <strong>Private Mark :</strong>
+          <div style="height:20px;"></div>
+        </div>
+        <div class="box">
+          <strong>E-Way Bill No</strong>
+          <div style="height:12px;"></div>
+        </div>
+      </div>
+
+      <div class="foot-row">
+        <div class="box">
+          <strong>GST PAY  :</strong>
+          <div style="height:12px;"></div>
+        </div>
+        <div class="box">
+          <strong>Value :</strong>
+          <div style="height:12px;"></div>
+        </div>
+        <div class="box">
+          <strong>Inv. No. :</strong>
+          <div style="height:12px;"></div>
+        </div>
+        <div class="signature">
+          Signature
+        </div>
+      </div>
+
+      <div class="note center">
+        Note : No Responsibility for Leakeage & Breakage Company Is Not Responsbility For Re Booking.
+      </div>
+
+    </div>
+  </div>
+</body>
+</html>

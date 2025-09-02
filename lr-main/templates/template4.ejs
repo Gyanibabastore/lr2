@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>SHRI MARUTI TRANSPORT COMPANY - Half A4 (Compressed)</title>
+<style>
+  @page { size: A4; margin: 8mm; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #fff;
+    -webkit-print-color-adjust: exact;
+  }
+  body {
+    font-family: Arial, sans-serif;
+    font-size: 12px;
+  }
+  .half-a4 {
+    width: 210mm; 
+    height: 148.5mm; /* Half A4 height */
+    overflow: hidden;
+    padding: 4mm; /* smaller padding */
+    box-sizing: border-box;
+  }
+  .frame { border: 2px solid #111; padding: 4px; }
+  .bar-top {
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    margin-bottom: 2px; /* tighter spacing */
+  }
+  .bar-top .center { font-weight: bold; }
+  .top-row { display: flex; align-items: center; gap: 6px; }
+  .left-logo { width: 110px; flex: 0 0 110px; }
+  .center-title { flex: 1; text-align: center; }
+  .center-title h1 {
+    margin: 0;
+    font-size: 26px; /* slightly smaller */
+    font-weight: 800;
+    color: #c80000;
+    white-space: nowrap;
+  }
+  .center-title .addr { font-size: 11px; font-weight: bold; margin-top: 2px; }
+  .center-title .email { font-size: 10px; margin-top: 1px; }
+  .right-contact { width: 140px; text-align: right; font-size: 10px; }
+  .middle-line { height: 2px; background: #c80000; margin: 4px 0; }
+  table { width: 100%; border-collapse: collapse; }
+  td, th { border: 1px solid #111; padding: 3px; vertical-align: top; }
+  .red { color: #c80000; font-weight: bold; }
+  .checkbox { display: inline-block; width: 12px; height: 12px; border: 1px solid #000; margin-left: 3px; }
+  .line { border-bottom: 1px solid #111; height: 14px; margin: 2px 0; }
+  .goods th { background: #f5f5f5; font-weight: bold; text-align: center; }
+  .note { font-size: 9px; text-align: center; border: 1px solid #aaa; padding: 1px; display: inline-block; }
+  .footer { display: flex; justify-content: space-between; font-size: 10px; margin-top: 3px; }
+</style>
+</head>
+<body>
+<div class="half-a4">
+  <div class="frame">
+    <!-- Top info -->
+    <div class="bar-top">
+      <div>GSTIN:</div>
+      <div class="center">SUBJECT TO MUMBAI JURISDICATION ONLY</div>
+      <div>Ph: +91542058793</div>
+    </div>
+    <!-- Header -->
+    <div class="top-row">
+      <div class="left-logo">
+        <img src="https://i.ibb.co/bgn7bzWr/maruti-logo.jpg" alt="Maruti Logo" style="max-width:100%; height:auto;">
+      </div>
+      <div class="center-title">
+        <h1>SHRI MARUTI TRANSPORT COMPANY</h1>
+        <div class="addr">78 SHIVAJI COMPLEX 414 SENAPATI BAPAT MARG LOWER PAREL MUMBAI</div>
+        <div class="email">INFO@SMTCONROAD.COM</div>
+      </div>
+      <div class="right-contact">
+        <div style="border:1px solid #111; padding: 1px;"><strong>Cell:</strong></div>
+      </div>
+    </div>
+    <div class="middle-line"></div>
+    <!-- Three boxes row -->
+    <div style="display:flex; gap: 4px; margin-bottom: 2px;">
+      <div style="flex:1; border:1px solid #111; padding: 3px; font-size: 10px;">
+        <div class="red">SCHEDULE OF DEMURAGE CHARGES</div>
+        Demurrage chargeable after ………… Days from today @ Rs ……… Per day peer Qtl. on Weight charges.
+      </div>
+      <div style="width: 180px; border: 2px solid #c80000; text-align: center; padding: 3px;">
+        <div class="red">CONSIGNEE COPY</div>
+        AT OWNER'S RISK
+      </div>
+      <div style="width: 180px; border: 1px solid #111; padding: 3px; font-size: 9px;">
+        This consignment will not be detained, diverted, re-routed or re-booked without Consignment Bank's written permission. Will be delivered at the destination.<br>
+        Address of Delivery Door/Godown
+      </div>
+    </div>
+    <!-- Insurance/Service tax row -->
+    <div style="display:flex; gap: 4px; margin-bottom: 2px;">
+      <div style="flex:1; border:1px solid #111; padding: 3px; font-size: 10px;">
+        Service Tax Pay By : Consignor <span class="checkbox"></span> <br>Consignee <span class="checkbox"></span><br> Transpoter <span class="checkbox"></span><br><br>
+        Vehicle <span class="red"><%=truckNumber%></span>
+      </div>
+      <div style="width: 280px; border:1px solid #111; padding: 3px; font-size: 10px;">
+        <div class="red">INSURANCE</div>
+        The Consignor has stated that: He has not insured the consignment.<br>
+        Company __________________ Policy No ______________ <br><br>Amount ______________ Date______________ Risk ______
+      </div>
+      <div style="width: 160px; border:1px solid #111; padding: 3px; font-size: 10px;">
+        State: ______<br>
+        <br>
+        Issue Office: ______<br>
+        <br>
+        Time:  <%=time%><br>
+        <br>
+        Date: <%=date %>
+      </div>
+    </div>
+    <!-- Consignor/Consignee -->
+    <div style="border:1px solid #111; padding: 3px; margin-bottom: 2px; font-size: 10px;">
+      <div>Consignor's Name & Address</div>
+      <div class="line"></div>
+      <div>Consignee Name & Address</div>
+      <div class="line"></div>
+    </div>
+    <!-- Goods table -->
+    <table class="goods" style="margin-bottom: 2px; font-size: 10px;">
+      <tr>
+        <th>No of Package</th>
+        <th>Package Mode</th>
+        <th>DESCIPTION (said to contain)</th>
+        <th>Weight Actual</th>
+        <th>Charged</th>
+        <th>Rate</th>
+        <th>Weight Rs.</th>
+        <th>Ps.</th>
+      </tr>
+      <tr style="height:26px;">
+        <td class="center">0</td>
+        <td class="center">LOOSE</td>
+        <td class="center red"><%= description %></td>
+        <td class="center"><%= weight %></td>
+        <td class="center"></td>
+        <td>Fright<br>Hamali<br>Sur.Ch.<br>St.Ch<br>Risk.Ch<br>Gst.Ch<br>Total</td>
+        <td></td>
+        <td></td>
+      </tr>
+      <tr>
+        <td colspan="7" class="center"><span class="note">Company is not responsible for the Leakage, theft & Breakage</span></td>
+      </tr>
+    </table>
+    <!-- Footer -->
+    <div class="footer">
+      <div>Value</div>
+      <div>Party Sign.</div>
+      <div class="red">SHRI MARUTI TRANSPORT COMPANY</div>
+    </div>
+  </div>
+</div>
+</body>
+</html>
