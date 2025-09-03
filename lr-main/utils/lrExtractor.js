@@ -6,7 +6,7 @@ const { GoogleGenerativeAI } = require("@google/generative-ai");
 // Create Gemini client
 console.log("hii");
 console.log("Google API Key:",process.env.GEMINI_API_KEY ? "Loaded" : "Missing");
-const genAI = new GoogleGenerativeAI("AIzaSyD8GsBPjknNbTYs9lTQCoYusSpY6-9k_H0");
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 
 async function extractDetails(message) {
