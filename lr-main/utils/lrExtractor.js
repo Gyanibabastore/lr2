@@ -6,12 +6,10 @@ const { GoogleGenerativeAI } = require("@google/generative-ai");
 // Create Gemini client
 console.log("hii");
 console.log("Google API Key:",process.env.GEMINI_API_KEY ? "Loaded" : "Missing");
-const genAI = new GoogleGenerativeAI({
-  apiKey: "AIzaSyD8GsBPjknNbTYs9lTQCoYusSpY6-9k_H0"
-});
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 async function extractDetails(message) {
-  console.log("📩 Received Message:", message);
+ 
 
   const prompt = `
 You are a smart logistics parser.
@@ -56,9 +54,11 @@ Ensure the output is only the raw JSON — no extra text, notes, or formatting o
     console.log("⏳ Sending prompt to Gemini...");
 
     const model = genAI.getGenerativeModel({ model: "gemini-1.5-pro-latest" });
-
+       console.log("⏳ 1");
     const result = await model.generateContent(prompt);
+   console.log("⏳ 2");
     const response = await result.response;
+   console.log("⏳ 3");
     let resultText = response.text();
 
     console.log("📤 Raw Response from Gemini:\n", resultText);
