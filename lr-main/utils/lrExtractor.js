@@ -4,7 +4,7 @@ dotenv.config();
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 
 // Create Gemini client
-console.log("Google API Key:", process.env.GOOGLE_API_KEY ? "Loaded" : "Missing");
+console.log("Google API Key:",process.env.GEMINI_API_KEY ? "Loaded" : "Missing");
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 async function extractDetails(message) {
