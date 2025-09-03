@@ -7,7 +7,7 @@ const { GoogleGenerativeAI } = require("@google/generative-ai");
 console.log("hii");
 console.log("Google API Key:",process.env.GEMINI_API_KEY ? "Loaded" : "Missing");
 const genAI = new GoogleGenerativeAI({
-  apiKey: process.env.GOOGLE_API_KEY
+  apiKey: "AIzaSyD8GsBPjknNbTYs9lTQCoYusSpY6-9k_H0"
 });
 
 async function extractDetails(message) {
