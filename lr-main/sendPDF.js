@@ -9,27 +9,26 @@ const subadminPath = path.join(__dirname, './subadmin.json');
 function normalizePhone(number) {
   if (!number) return null;
 
-  // remove non-digits
+  // Remove spaces, dashes etc.
   number = number.toString().replace(/\D/g, "");
 
-  // If already 10 digit → assume India
+  // Already starts with 91 and has 12 digits → add +
+  if (number.startsWith("91") && number.length === 12) {
+    return `+${number}`;
+  }
+
+  // Only 10 digits → assume Indian mobile → add +91
   if (number.length === 10) {
     return `+91${number}`;
   }
 
-  // If 12 digit starts with 91 → add +
-  if (number.length === 12 && number.startsWith("91")) {
-    return `+${number}`;
-  }
-
-  // If starts with + and length > 10 → valid
-  if (number.startsWith("+") && number.length > 10) {
+  // Already includes + → return as-is
+  if (number.startsWith("+")) {
     return number;
   }
 
-  // Else invalid
-  console.error("❌ Invalid phone format:", number);
-  return null;
+  // Fallback: just add +
+  return `+${number}`;
 }
 
 async function sendPDF(to, filePath, templateNumber = null, originalMessage = '', truckNumber = null) {
