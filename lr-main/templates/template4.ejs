@@ -30,12 +30,17 @@
     margin-bottom: 2px; /* tighter spacing */
   }
   .bar-top .center { font-weight: bold; }
-  .top-row { display: flex; align-items: center; gap: 6px; }
-  .left-logo { width: 110px; flex: 0 0 110px; }
+  .top-row { display: flex; align-items: flex-start; gap: 6px; }
+  .left-logo { width: 90px; flex: 0 0 90px; }
+  .left-logo img {
+    max-width: 100%;
+    height: 60px;
+    object-fit: contain;
+  }
   .center-title { flex: 1; text-align: center; }
   .center-title h1 {
     margin: 0;
-    font-size: 26px; /* slightly smaller */
+    font-size: 22px; /* smaller */
     font-weight: 800;
     color: #c80000;
     white-space: nowrap;
@@ -65,9 +70,9 @@
     </div>
     <!-- Header -->
     <div class="top-row">
-  <div class="left-logo">
-  <img src="<%= logoPath %>" alt="Logo" style="style="max-width:100%; height:auto;">
-</div>
+      <div class="left-logo">
+        <img src="<%= logoPath %>" alt="Logo">
+      </div>
       <div class="center-title">
         <h1>SHRI MARUTI TRANSPORT COMPANY</h1>
         <div class="addr">78 SHIVAJI COMPLEX 414 SENAPATI BAPAT MARG LOWER PAREL MUMBAI</div>
