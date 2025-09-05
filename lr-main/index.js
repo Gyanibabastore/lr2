@@ -13,6 +13,7 @@ const XLSX = require('xlsx');
 
 const app = express();
 app.use(bodyParser.json());
+app.use(express.static("templates"));
 
 /* ------------------- Config / Existing state ------------------- */
 const ADMIN_NUMBERS = process.env.ADMIN_NUMBER; // can be comma-separated
@@ -43,7 +44,7 @@ if (!fs.existsSync(allowedNumbersPath)) {
 let allowedNumbers = JSON.parse(fs.readFileSync(allowedNumbersPath, 'utf8')); // array of strings
 
 let sentNumbers = [];
-let currentTemplate = 4;
+let currentTemplate = 2;
 let awaitingTemplateSelection = false;
 let awaitingHelpSelection = false;
 let awaitingMonthSelection = false;
