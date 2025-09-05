@@ -44,7 +44,7 @@ if (!fs.existsSync(allowedNumbersPath)) {
 let allowedNumbers = JSON.parse(fs.readFileSync(allowedNumbersPath, 'utf8')); // array of strings
 
 let sentNumbers = [];
-let currentTemplate = 2;
+let currentTemplate = 1;
 let awaitingTemplateSelection = false;
 let awaitingHelpSelection = false;
 let awaitingMonthSelection = false;
