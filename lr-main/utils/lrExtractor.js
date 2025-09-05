@@ -4,7 +4,7 @@ dotenv.config();
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 
 // Create Gemini client
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const genAI = new GoogleGenerativeAI("AIzaSyD8GsBPjknNbTYs9lTQCoYusSpY6-9k_H0");
 
 async function extractDetails(message) {
   console.log("📩 Received Message:", message);
