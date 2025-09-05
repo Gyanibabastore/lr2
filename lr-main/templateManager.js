@@ -24,7 +24,16 @@ async function generatePDFWithTemplate(templateNumber, lrData, rawMessage) {
   const outputPath = path.join(outputDir, `LR-${safeFileName}-${Date.now()}.pdf`);
 
   // Render EJS to HTML
-  const html = await ejs.renderFile(templatePath, lrData);
+ const logoPath = path.join(__dirname, 'templates', 'namaskarm-logo.jpg');
+const logoBase64 = fs.readFileSync(logoPath).toString('base64');
+const logoDataUri = `data:image/jpeg;base64,${logoBase64}`;
+console.log("Logo Data URI:", logoDataUri.substring(0, 100));
+
+const html = await ejs.renderFile(templatePath, { 
+  ...lrData, 
+  logoPath: logoDataUri
+});
+
 
   // ✅ Launch Puppeteer (Root/Docker safe)
   const browser = await puppeteer.launch({
@@ -37,7 +46,8 @@ async function generatePDFWithTemplate(templateNumber, lrData, rawMessage) {
       '--no-first-run',
       '--no-zygote',
       '--single-process',           // Optional: may improve Docker stability
-      '--disable-gpu'
+      '--disable-gpu',
+       '--allow-file-access-from-files'
     ]
   });
 
