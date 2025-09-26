@@ -18,9 +18,7 @@ app.use(bodyParser.json());
 app.use(express.static("templates"));
 
 /* ------------------- Config / Existing state ------------------- */
-const ADMIN_NUMBERS_RAW = process.env.ADMIN_NUMBER || ''; // can be comma-separated
-const ADMIN_NUMBERS = (ADMIN_NUMBERS_RAW.split?.(',') || []).map(s => s.trim()).filter(Boolean);
-
+const ADMIN_NUMBERS = process.env.ADMIN_NUMBER; // can be comma-separated
 const allowedNumbersPath = path.join(__dirname, './allowedNumbers.json');
 const subadminPath = path.join(__dirname, './subadmin.json');
 
@@ -37,9 +35,9 @@ try {
   console.error("❌ Error reading subadmin.json:", err.message);
 }
 
-let allNumber = [ ...ADMIN_NUMBERS, ...subadminNumbers ].filter(Boolean);
+let allNumber = [ADMIN_NUMBERS, ...subadminNumbers].filter(Boolean);
 function updateAllNumbers() {
-  allNumber = [ ...ADMIN_NUMBERS, ...subadminNumbers ].filter(Boolean);
+  allNumber = [ADMIN_NUMBERS, ...subadminNumbers].filter(Boolean);
 }
 
 if (!fs.existsSync(allowedNumbersPath)) {
@@ -48,7 +46,6 @@ if (!fs.existsSync(allowedNumbersPath)) {
 let allowedNumbers = [];
 try {
   allowedNumbers = JSON.parse(fs.readFileSync(allowedNumbersPath, 'utf8'));
-  if (!Array.isArray(allowedNumbers)) allowedNumbers = [];
 } catch (e) {
   allowedNumbers = [];
 }
@@ -220,7 +217,7 @@ app.post('/webhook', async (req, res) => {
 
     const from = messages.from;
     const message = messages.text?.body?.trim();
-    const adminNumbers = ADMIN_NUMBERS;
+    const adminNumbers = (process.env.ADMIN_NUMBER || '').split(',').map(s => s.trim()).filter(Boolean);
 
     if (!allowedNumbers.includes(from) && !adminNumbers.includes(from)) {
       console.log(`⛔ Blocked message from unauthorized number: ${from}`);
@@ -547,12 +544,11 @@ app.post('/webhook', async (req, res) => {
         return res.sendStatus(200);
       }
 
-      if (!(await isStructuredLR(cleanedMessage))) {
-        console.log("⚠ Ignored message (not LR structured):", message);
-        if (ADMIN_NUMBERS.length > 0) {
-          await sendWhatsAppMessage(ADMIN_NUMBERS[0], `⚠ Ignored unstructured LR from ${from}\n\nMessage: ${message}`);
-        }
-        return res.sendStatus(200);
+      // Keep original structured check, but defensive: try to extract and if AI fails do not ignore outright
+      const extractedForCheck = await extractDetails(cleanedMessage);
+      if (!(extractedForCheck.truckNumber && extractedForCheck.to && extractedForCheck.weight && extractedForCheck.description)) {
+        // Log and continue to attempt processing (don't return). This prevents ignoring valid messages due to parser failure.
+        console.log("⚠ Parser incomplete for message, proceeding with best-effort extraction:", message);
       }
 
       const extracted = await extractDetails(cleanedMessage);
@@ -574,8 +570,8 @@ app.post('/webhook', async (req, res) => {
         });
       } catch (err) {
         console.error("❌ PDF Error:", err.message || err);
-        if (ADMIN_NUMBERS.length > 0) {
-          await sendWhatsAppMessage(ADMIN_NUMBERS[0], `❌ Failed to generate/send PDF for ${from}`);
+        if (ADMIN_NUMBERS && ADMIN_NUMBERS.length > 0) {
+          await sendWhatsAppMessage(ADMIN_NUMBERS.split?.(',')[0] || ADMIN_NUMBERS, `❌ Failed to generate/send PDF for ${from}`);
         }
       }
       if (!sentNumbers.includes(from)) sentNumbers.push(from);
