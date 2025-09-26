@@ -1,30 +1,15 @@
-// utils/lrExtractor.js
-// Gemini-only LR extractor with hardened prompt, model discovery, rate-limit respect.
-// Exports: extractDetails(message) and isStructuredLR(message)
 
-const { GoogleGenerativeAI } = require("@google/generative-ai");
 
-// --- API key: prefer env var; if you want inline default, replace the empty string or put your key.
-// SECURITY: recommended to set process.env.GEMINI_API_KEY instead of hardcoding.
-const API_KEY = "AIzaSyDCpWBb1e9rWrxELhM2ieqtH9ZNqLXKiPc";
+const API_KEY = "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"; // 
 
-// Preferred model order (first available will be selected)
 const PREFERRED_MODELS = [
-  "models/gemini-2.0-flash",
-  "models/gemini-1.5-flash",
-  "models/gemini-1.5-pro",
-  "models/gemini-1.5"
+  "gpt-5-nano",
+  "gpt-5-mini",
+  "gpt-5-small"
 ];
 
-let SELECTED_MODEL = null;
-let modelDiscoveryTried = false;
+let SELECTED_MODEL = PREFERRED_MODELS[0];
 let rateLimitResetTs = 0;
-
-if (!API_KEY) {
-  console.warn("[lrExtractor] WARNING: No GEMINI API key found. Set process.env.GEMINI_API_KEY.");
-}
-
-const genAI = new GoogleGenerativeAI(API_KEY);
 
 // ----------------- Helpers -----------------
 const normalizeTruck = (s) => {
@@ -41,18 +26,11 @@ const capitalize = (str) => {
     .map((w) => (w ? w.charAt(0).toUpperCase() + w.slice(1) : ""))
     .join(" ");
 };
-const parseNumberLike = (t) => {
-  if (!t) return "";
-  const cleaned = String(t).replace(/,/g, "").trim();
-  const m = cleaned.match(/(\d+(?:\.\d+)?)/);
-  return m ? m[1] : "";
-};
 
 // try extract JSON object from messy AI text
 function tryParseJsonFromText(text) {
   if (!text) return null;
   const txt = String(text).trim();
-  // find first {...} block
   const jmatch = txt.match(/\{[\s\S]*\}/);
   if (!jmatch) return null;
   const raw = jmatch[0];
@@ -61,119 +39,32 @@ function tryParseJsonFromText(text) {
   } catch (e) {
     try {
       const safe = raw
-        .replace(/([{,]\s*)([A-Za-z0-9_]+)\s*:/g, '$1"$2":') // quote keys
-        .replace(/'/g, '"') // single -> double quotes
-        .replace(/,(\s*[}\]])/g, "$1"); // remove trailing commas
+        .replace(/([{,]\s*)([A-Za-z0-9_]+)\s*:/g, '$1"$2":')
+        .replace(/'/g, '"')
+        .replace(/,(\s*[}\]])/g, "$1");
       return JSON.parse(safe);
     } catch (e2) {
+      console.error("[lrExtractor] JSON parse failed twice:", e2.message);
       return null;
     }
   }
 }
 
-// ----------------- Model discovery -----------------
-async function ensureModelSelected() {
-  if (SELECTED_MODEL || modelDiscoveryTried) return;
-  modelDiscoveryTried = true;
-
-  try {
-    console.log("[lrExtractor] Discovering available models via REST...");
-    const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${API_KEY}`;
-    const resp = await fetch(url, { method: "GET" });
-    if (!resp.ok) {
-      console.warn("[lrExtractor] listModels HTTP error:", resp.status);
-      SELECTED_MODEL = PREFERRED_MODELS[0];
-      console.log("[lrExtractor] Falling back to default model:", SELECTED_MODEL);
-      return;
-    }
-    const body = await resp.json();
-    const available = (body.models || []).map(m => m.name || m.model || m.id).filter(Boolean);
-    console.log("[lrExtractor] Available models:", available);
-    for (const pref of PREFERRED_MODELS) {
-      if (available.includes(pref)) {
-        SELECTED_MODEL = pref;
-        break;
-      }
-    }
-    if (!SELECTED_MODEL) SELECTED_MODEL = available.length ? available[0] : PREFERRED_MODELS[0];
-    console.log("[lrExtractor] Selected model:", SELECTED_MODEL);
-  } catch (e) {
-    console.error("[lrExtractor] model discovery failed:", e && e.message ? e.message : e);
-    SELECTED_MODEL = PREFERRED_MODELS[0];
-    console.log("[lrExtractor] Falling back to default model:", SELECTED_MODEL);
-  }
-}
-
-// ----------------- Low-level AI call with rate-limit respect -----------------
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-async function aiCallWithRateLimit(prompt) {
-  // If API told us to wait earlier, skip calls until that time
-  if (Date.now() < rateLimitResetTs) {
-    console.warn("[lrExtractor] Skipping AI call due to prior rate-limit until", new Date(rateLimitResetTs));
-    return "";
-  }
-
-  await ensureModelSelected();
-
-  try {
-    // prefer typed model client if available
-    const modelObj = genAI.getGenerativeModel ? genAI.getGenerativeModel({ model: SELECTED_MODEL }) : null;
-    if (modelObj && typeof modelObj.generateContent === "function") {
-      const result = await modelObj.generateContent(prompt, { temperature: 0, maxOutputTokens: 512 });
-      return result?.response?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-    }
-    if (typeof genAI.generate === "function") {
-      const resp = await genAI.generate({ prompt, temperature: 0, maxOutputTokens: 512, model: SELECTED_MODEL });
-      return resp?.text || "";
-    }
-    return "";
-  } catch (err) {
-    const msg = err && err.message ? err.message : String(err);
-    console.error("[lrExtractor] aiCall error:", msg);
-
-    // Respect RetryInfo if present (common with 429)
-    const retryMatch = msg.match(/"retryDelay"\s*:\s*"?([0-9.]+)\s*s"?/i) || msg.match(/Please retry in\s*([0-9.]+)s/i);
-    if (retryMatch) {
-      const sec = parseInt(retryMatch[1], 10);
-      if (!isNaN(sec)) {
-        rateLimitResetTs = Date.now() + (sec + 1) * 1000;
-        console.warn(`[lrExtractor] API requested retry-after -> skipping AI until ${new Date(rateLimitResetTs)}`);
-      }
-    }
-    return "";
-  }
-}
-
-// ----------------- Hardened prompt builder -----------------
+// ----------------- Build the prompt -----------------
 function buildStrictPrompt(message) {
   return `
-You are a smart logistics parser.
+You are a precise logistics parser. Extract ONLY a single JSON object.
 
-Extract the following mandatory details from this message:
+Mandatory fields: truckNumber, to, weight, description
+Optional: from, name
 
-- truckNumber (which may be 9 or 10 characters long, possibly containing spaces or hyphens) 
-  Example: "MH 09 HH 4512" should be returned as "MH09HH4512"
-- to
-- weight
-- description
+Rules:
+- Normalize truckNumber like MH09HH4512 (remove spaces/dots/hyphens).
+- If no plate, but words like "brllgada", "bellgadi", "new truck" etc. exist, set truckNumber to that word.
+- Preserve "fix" in weight.
+- If a field not found, use "".
 
-Also extract the optional fields:
-- from (optional)
-- name (if the message contains a pattern like "n - name", "n-name", "n. name", etc.; extract the text after the 'n' marker)
-
-If truckNumber is missing but the message contains words like "brllgada", "bellgade", "bellgad", "bellgadi", "new truck", "new tractor", or "new gadi",
-then set truckNumber to that phrase (exactly as it appears).
-
-If the weight contains the word "fix" or similar, preserve it as-is.
-
-Here is the message:
-"""${String(message).replace(/```/g, "")}"""
-
-Return ONLY a single valid JSON object and NOTHING ELSE. Do NOT include markdown, code fences, comments, or any extra text.
-
-Use exactly this schema (fields must exist; use empty string "" when a field is not found):
-
+Schema:
 {
   "truckNumber": "",
   "from": "",
@@ -182,102 +73,156 @@ Use exactly this schema (fields must exist; use empty string "" when a field is 
   "description": "",
   "name": ""
 }
+
+Message:
+"""${String(message).replace(/```/g, "")}"""
 `;
 }
 
-// ----------------- Public API (Gemini-only extraction) -----------------
+// ----------------- AI Call -----------------
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function aiCallWithRateLimit(prompt) {
+  if (Date.now() < rateLimitResetTs) {
+    console.warn("[lrExtractor] Skipping AI call until:", new Date(rateLimitResetTs));
+    return "";
+  }
+
+  try {
+    console.log("[lrExtractor] Sending request to OpenAI Responses API with model:", SELECTED_MODEL);
+
+    const body = {
+      model: SELECTED_MODEL,
+      input: prompt,
+      temperature: 0,
+      max_output_tokens: 600
+    };
+
+    const resp = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${API_KEY}`
+      },
+      body: JSON.stringify(body)
+    });
+
+    if (resp.status === 429 || resp.status === 503) {
+      const ra = resp.headers.get("retry-after");
+      const waitSec = ra ? parseInt(ra, 10) : 5;
+      rateLimitResetTs = Date.now() + (waitSec + 1) * 1000;
+      console.warn(`[lrExtractor] Rate limit hit. Backing off for ${waitSec}s.`);
+      return "";
+    }
+
+    if (!resp.ok) {
+      const text = await resp.text();
+      console.error("[lrExtractor] OpenAI API error:", resp.status, text.slice(0, 300));
+      return "";
+    }
+
+    const data = await resp.json();
+    let outText = "";
+
+    if (Array.isArray(data.output)) {
+      for (const o of data.output) {
+        if (o.type === "output_text" && o.text) outText += o.text + "\n";
+        if (o.type === "message" && Array.isArray(o.content)) {
+          for (const c of o.content) if (c.type === "output_text" && c.text) outText += c.text;
+        }
+      }
+    } else if (data?.output_text) outText = data.output_text;
+    else if (data?.text) outText = data.text;
+
+    console.log("[lrExtractor] AI raw text length:", outText.length);
+    return outText.trim();
+  } catch (err) {
+    console.error("[lrExtractor] aiCall error:", err.message || err);
+    return "";
+  }
+}
+
+// ----------------- Public API -----------------
 async function extractDetails(message) {
+  console.log("\n================ NEW EXTRACTION START ================");
   const startTs = Date.now();
-  console.log("[lrExtractor] extractDetails called. Message snippet:", String(message || "").slice(0,300).replace(/\n/g, ' | '));
 
   if (!message) {
-    console.log("[lrExtractor] Empty message -> returning empty object.");
-    return { truckNumber: "", from: "", to: "", weight: "", description: "", name: "" };
+    console.warn("[lrExtractor] Empty message received.");
+    return null;
   }
 
   const prompt = buildStrictPrompt(message);
 
-  // Always use AI (3 attempts)
   for (let attempt = 0; attempt < 3; attempt++) {
-    const attemptNote = attempt === 0 ? "" : attempt === 1 ? "\nNOTE: Return JSON only, ensure keys exist." : "\nFINAL: If unsure, leave empty.";
-    const fullPrompt = prompt + attemptNote;
-    console.log(`[lrExtractor] AI attempt ${attempt+1} - sending prompt (first200):`, fullPrompt.slice(0,200).replace(/\n/g,' '));
+    const suffix = attempt === 0 ? "" : attempt === 1 ? "\nNOTE: JSON only!" : "\nFINAL ATTEMPT: Ensure keys exist.";
+    const fullPrompt = prompt + suffix;
+
+    console.log(`[lrExtractor] Attempt ${attempt + 1} - prompt size:`, fullPrompt.length);
 
     const aiText = await aiCallWithRateLimit(fullPrompt);
     if (!aiText) {
-      console.log(`[lrExtractor] AI attempt ${attempt+1} returned empty response.`);
+      console.warn(`[lrExtractor] Attempt ${attempt + 1} returned empty.`);
       continue;
     }
 
-    console.log(`[lrExtractor] AI raw response (snippet): ${String(aiText).slice(0,800)}`);
+    console.log(`[lrExtractor] Attempt ${attempt + 1} raw response:`, aiText.slice(0, 500));
 
     const parsed = tryParseJsonFromText(aiText);
-    if (parsed && typeof parsed === "object") {
-      console.log(`[lrExtractor] AI parsed JSON (raw):`, parsed);
+    if (!parsed) {
+      console.warn(`[lrExtractor] Attempt ${attempt + 1} -> JSON parse failed.`);
+      continue;
+    }
 
-      // sanitize & normalize
-      const out = {
-        truckNumber: parsed.truckNumber ? String(parsed.truckNumber).trim() : "",
-        from: parsed.from ? String(parsed.from).trim() : "",
-        to: parsed.to ? String(parsed.to).trim() : "",
-        weight: parsed.weight ? String(parsed.weight).trim() : "",
-        description: parsed.description ? String(parsed.description).trim() : "",
-        name: parsed.name ? String(parsed.name).trim() : ""
-      };
+    console.log("[lrExtractor] Parsed JSON:", parsed);
 
-      // ----------- ONLY FIX: if AI omitted 'from', try "A to B" extraction from original message -----------
-      if ((!out.from || out.from.trim() === "") && message) {
-        const m = String(message).match(/(.+?)\s*(?:to|->|→|–|—|-)\s*(.+)/i);
-        if (m) {
-          const candidateFrom = m[1].trim();
-          // avoid treating truck plates or pure numbers as 'from'
-          const isPlate = /^[A-Za-z]{2}\s?\d{1,2}\s?[A-Za-z]{1,3}\s?\d{1,4}$/i.test(candidateFrom);
-          const isNumber = /^\d+(\.\d+)?$/.test(candidateFrom.replace(/\s+/g,''));
-          if (!isPlate && !isNumber) {
-            out.from = candidateFrom;
-          }
-        }
+    const out = {
+      truckNumber: parsed.truckNumber ? String(parsed.truckNumber).trim() : "",
+      from: parsed.from ? String(parsed.from).trim() : "",
+      to: parsed.to ? String(parsed.to).trim() : "",
+      weight: parsed.weight ? String(parsed.weight).trim() : "",
+      description: parsed.description ? String(parsed.description).trim() : "",
+      name: parsed.name ? String(parsed.name).trim() : ""
+    };
+
+    // normalize
+    const specials = ["new truck","new tractor","new gadi","bellgadi","bellgada","bellgade","bellgad","brllgada"];
+    if (out.truckNumber && !specials.includes(out.truckNumber.toLowerCase())) {
+      out.truckNumber = normalizeTruck(out.truckNumber);
+    }
+    if (out.from) out.from = capitalize(out.from);
+    if (out.to) out.to = capitalize(out.to);
+    if (out.description) out.description = capitalize(out.description);
+    if (out.name) out.name = capitalize(out.name);
+
+    // normalize weight
+    if (out.weight && !/fix/i.test(out.weight)) {
+      const n = parseFloat(out.weight.replace(/,/g, ""));
+      if (!isNaN(n)) {
+        out.weight = n < 100 ? Math.round(n * 1000).toString() : Math.round(n).toString();
       }
-      // -----------------------------------------------------------------------------------------------
+    }
 
-      // normalize truck unless it's a special phrase
-      const specials = ["new truck","new tractor","new gadi","bellgadi","bellgada","bellgade","bellgad","brllgada"];
-      if (out.truckNumber && !specials.includes(out.truckNumber.toLowerCase())) out.truckNumber = normalizeTruck(out.truckNumber);
-      if (out.from) out.from = capitalize(out.from);
-      if (out.to) out.to = capitalize(out.to);
-      if (out.description) out.description = capitalize(out.description);
-      if (out.name) out.name = capitalize(out.name);
-
-      // weight normalization (preserve 'fix')
-      if (out.weight && !/fix/i.test(out.weight)) {
-        const wn = String(out.weight).replace(/,/g,"");
-        const n = parseFloat(wn);
-        if (!isNaN(n)) {
-          if (n > 0 && n < 100) out.weight = Math.round(n * 1000).toString();
-          else out.weight = Math.round(n).toString();
-        }
-      }
-
-      console.log("[lrExtractor] Final parsed (from AI). Took(ms):", Date.now() - startTs, "Result:", out);
+    const mandatoryPresent = out.truckNumber && out.to && out.weight && out.description;
+    if (mandatoryPresent) {
+      console.log("[lrExtractor] SUCCESS ✅ Took(ms):", Date.now() - startTs, "Final:", out);
+      console.log("=====================================================\n");
       return out;
     } else {
-      console.log(`[lrExtractor] AI attempt ${attempt+1} produced unparseable output.`);
+      console.warn("[lrExtractor] Attempt failed (missing mandatory fields).", out);
     }
+
+    await sleep(400 * (attempt + 1));
   }
 
-  // AI failed all attempts -> return empty fields (no fallback)
-  console.warn("[lrExtractor] AI failed after attempts — returning empty fields (NO fallback).");
-  return { truckNumber: "", from: "", to: "", weight: "", description: "", name: "" };
+  console.error("[lrExtractor] ❌ All attempts failed. Returning null.");
+  console.log("=====================================================\n");
+  return null;
 }
 
 async function isStructuredLR(message) {
-  try {
-    const d = await extractDetails(message);
-    return Boolean(d.truckNumber && d.to && d.weight && d.description);
-  } catch (e) {
-    console.error("[lrExtractor] isStructuredLR error:", e && e.message ? e.message : e);
-    return false;
-  }
+  const d = await extractDetails(message);
+  return Boolean(d && d.truckNumber && d.to && d.weight && d.description);
 }
 
 module.exports = { extractDetails, isStructuredLR };
