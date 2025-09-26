@@ -1,3 +1,4 @@
+// app.js
 const express = require('express');
 const bodyParser = require('body-parser');
 require('dotenv').config();
@@ -15,8 +16,28 @@ const app = express();
 app.use(bodyParser.json());
 app.use(express.static("templates"));
 
+/* ------------------- Normalizer (E.164) ------------------- */
+function normalizePhone(input, defaultCountry = "91") {
+  if (input === undefined || input === null || input === "") return null;
+  let s = String(input).trim();
+  s = s.replace(/\uFF0B/g, "+"); // fullwidth plus -> +
+  if (s.startsWith("+")) {
+    s = "+" + s.slice(1).replace(/\D/g, "");
+  } else {
+    s = s.replace(/\D/g, "");
+  }
+  s = s.replace(/^\+?0+/, (m) => (m.startsWith("+") ? "+" : ""));
+  if (!s.startsWith("+")) {
+    if (s.length === 12 && s.startsWith(defaultCountry)) s = `+${s}`;
+    else if (s.length === 10) s = `+${defaultCountry}${s}`;
+    else s = `+${defaultCountry}${s}`;
+  }
+  if (!/^\+\d{6,15}$/.test(s)) return null;
+  return s;
+}
+
 /* ------------------- Config / Existing state ------------------- */
-const ADMIN_NUMBERS = process.env.ADMIN_NUMBER; // can be comma-separated
+const ADMIN_NUMBERS = process.env.ADMIN_NUMBER || ""; // can be comma-separated
 const allowedNumbersPath = path.join(__dirname, './allowedNumbers.json');
 const subadminPath = path.join(__dirname, './subadmin.json');
 
@@ -31,42 +52,52 @@ try {
   }
 } catch (err) {
   console.error("❌ Error reading subadmin.json:", err.message);
+  subadminNumbers = [];
 }
 
-let allNumber = [ADMIN_NUMBERS, ...subadminNumbers].filter(Boolean);
+// normalize env-admins into array
+const ADMIN_ARRAY = ADMIN_NUMBERS.split(',').map(s => s.trim()).filter(Boolean).map(n => normalizePhone(n)).filter(Boolean);
+
+// normalize subadmin list now
+subadminNumbers = (subadminNumbers || []).map(n => normalizePhone(n)).filter(Boolean);
+
+let allNumber = [...ADMIN_ARRAY, ...subadminNumbers].filter(Boolean);
 function updateAllNumbers() {
-  allNumber = [ADMIN_NUMBERS, ...subadminNumbers].filter(Boolean);
+  allNumber = [...ADMIN_ARRAY, ...subadminNumbers].filter(Boolean);
 }
 
 if (!fs.existsSync(allowedNumbersPath)) {
   fs.writeFileSync(allowedNumbersPath, JSON.stringify([], null, 2));
 }
 let allowedNumbers = JSON.parse(fs.readFileSync(allowedNumbersPath, 'utf8')); // array of strings
-
-let sentNumbers = [];
-let currentTemplate = 4;
-let awaitingTemplateSelection = false;
-let awaitingHelpSelection = false;
-let awaitingMonthSelection = false;
-
+// normalize allowedNumbers
+allowedNumbers = (allowedNumbers || []).map(n => normalizePhone(n)).filter(Boolean);
 function saveAllowedNumbers() {
   fs.writeFileSync(allowedNumbersPath, JSON.stringify(allowedNumbers, null, 2));
 }
 
 function saveSubadmins() {
   fs.writeFileSync(subadminPath, JSON.stringify(subadminNumbers, null, 2));
+  updateAllNumbers();
 }
 
-/* ------------------- WhatsApp send helper ------------------- */
+/* ------------------- WhatsApp send helper (normalize + log) ------------------- */
 async function sendWhatsAppMessage(to, text) {
   try {
+    const toNormalized = normalizePhone(to);
+    if (!toNormalized) {
+      console.warn("❗ sendWhatsAppMessage: invalid recipient, skipping:", to);
+      return;
+    }
+    const payload = {
+      messaging_product: "whatsapp",
+      to: toNormalized,
+      text: { body: text },
+    };
+    console.log("➡️ Sending WhatsApp payload:", JSON.stringify(payload));
     await axios.post(
       `https://graph.facebook.com/v19.0/${process.env.PHONE_NUMBER_ID}/messages`,
-      {
-        messaging_product: "whatsapp",
-        to,
-        text: { body: text },
-      },
+      payload,
       {
         headers: {
           Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
@@ -198,11 +229,18 @@ app.post('/webhook', async (req, res) => {
     const messages = changes?.messages?.[0];
     if (!messages) return res.sendStatus(200);
 
-    const from = messages.from;
-    const message = messages.text?.body?.trim();
-    const adminNumbers = (process.env.ADMIN_NUMBER || '').split(',').map(s => s.trim()).filter(Boolean);
+    // normalize incoming 'from' immediately
+    const rawFrom = messages.from;
+    const from = normalizePhone(rawFrom);
+    if (!from) {
+      console.warn("Invalid sender number from webhook:", rawFrom);
+      return res.sendStatus(400);
+    }
 
-    if (!allowedNumbers.includes(from) && !adminNumbers.includes(from)) {
+    const message = messages.text?.body?.trim();
+    const adminNumbers = (process.env.ADMIN_NUMBER || '').split(',').map(s => s.trim()).filter(Boolean).map(n => normalizePhone(n)).filter(Boolean);
+
+    if (!allowedNumbers.includes(from) && !adminNumbers.includes(from) && !allNumber.includes(from)) {
       console.log(`⛔ Blocked message from unauthorized number: ${from}`);
       return res.sendStatus(200);
     }
@@ -364,8 +402,9 @@ app.post('/webhook', async (req, res) => {
     if (adminNumbers.includes(from)) {
       if (cleanedMessage.startsWith('add ')) {
         const parts = message.split(' ').filter(Boolean);
-        const numberToAdd = parts[1];
-        if (!numberToAdd || !/^91\d{10}$/.test(numberToAdd)) {
+        const numberToAddRaw = parts[1];
+        const numberToAdd = normalizePhone(numberToAddRaw);
+        if (!numberToAdd) {
           await sendWhatsAppMessage(from, `ℹ️ Usage: add <number> e.g. add 919876543210`);
           return res.sendStatus(200);
         }
@@ -381,7 +420,8 @@ app.post('/webhook', async (req, res) => {
 
       if (cleanedMessage.startsWith('remove ')) {
         const parts = message.split(' ').filter(Boolean);
-        const numberToRemove = parts[1];
+        const numberToRemoveRaw = parts[1];
+        const numberToRemove = normalizePhone(numberToRemoveRaw);
         if (!numberToRemove) {
           await sendWhatsAppMessage(from, `ℹ️ Usage: remove <number>`);
           return res.sendStatus(200);
@@ -396,7 +436,7 @@ app.post('/webhook', async (req, res) => {
 
       if (cleanedMessage.startsWith('confirm remove ')) {
         const parts = message.split(' ').filter(Boolean);
-        const numberToRemove = parts[2];
+        const numberToRemove = normalizePhone(parts[2]);
         if (!numberToRemove) {
           await sendWhatsAppMessage(from, `❗ Usage: confirm remove <number>`);
           return res.sendStatus(200);
@@ -414,9 +454,9 @@ app.post('/webhook', async (req, res) => {
       // Subadmin Commands
       if (cleanedMessage.startsWith('new ')) {
         const parts = message.split(' ').filter(Boolean);
-        const numberToAdd = parts[1];
-        console.log(numberToAdd);
-        if (!numberToAdd || !/^91\d{10}$/.test(numberToAdd)) {
+        const numberToAddRaw = parts[1];
+        const numberToAdd = normalizePhone(numberToAddRaw);
+        if (!numberToAdd) {
           await sendWhatsAppMessage(from, `❌ Invalid format. Usage: new 91XXXXXXXXXX`);
           return res.sendStatus(200);
         }
@@ -433,7 +473,7 @@ app.post('/webhook', async (req, res) => {
 
       if (cleanedMessage.startsWith('delete ')) {
         const parts = message.split(' ').filter(Boolean);
-        const numberToRemove = parts[1];
+        const numberToRemove = normalizePhone(parts[1]);
         if (!subadminNumbers.includes(numberToRemove)) {
           await sendWhatsAppMessage(from, `⚠️ Subadmin not found: ${numberToRemove}`);
           return res.sendStatus(200);
@@ -444,7 +484,7 @@ app.post('/webhook', async (req, res) => {
 
       if (cleanedMessage.startsWith('confirm delete ')) {
         const parts = message.split(' ').filter(Boolean);
-        const numberToRemove = parts[2];
+        const numberToRemove = normalizePhone(parts[2]);
         if (!subadminNumbers.includes(numberToRemove)) {
           await sendWhatsAppMessage(from, `⚠️ Subadmin not found: ${numberToRemove}`);
           return res.sendStatus(200);
@@ -459,7 +499,7 @@ app.post('/webhook', async (req, res) => {
 
     /* ---------------- User cancel flow (allowed users) ---------------- */
     if ((cleanedMessage === 'cancel' || cleanedMessage === 'cancle') && (allowedNumbers.includes(from) || allNumber.includes(from))) {
-      const found = findRecentRowsForMobile(GENERATED_LOGS, from);
+      const found = findRecentRowsForMobile(GENERATED_LOGS, from.replace(/\D/g, ''));
       if (!found || found.length === 0) {
         await sendWhatsAppMessage(from, `ℹ️ No records found for your number in the last 24 hours.`);
         return res.sendStatus(200);
@@ -494,7 +534,7 @@ app.post('/webhook', async (req, res) => {
         delete awaitingCancelSelection[from];
         return res.sendStatus(200);
       }
-      const result = markRowsCancelled(GENERATED_LOGS, from, target);
+      const result = markRowsCancelled(GENERATED_LOGS, from.replace(/\D/g, ''), target);
       delete awaitingCancelSelection[from];
       if (result.updated && result.updated > 0) {
         const row = target.row;
@@ -532,8 +572,8 @@ app.post('/webhook', async (req, res) => {
 
       if (!(await isStructuredLR(cleanedMessage))) {
         console.log("⚠️ Ignored message (not LR structured):", message);
-        if (ADMIN_NUMBERS.length > 0) {
-          await sendWhatsAppMessage(ADMIN_NUMBERS[0], `⚠️ Ignored unstructured LR from ${from}\n\nMessage: ${message}`);
+        if (ADMIN_ARRAY.length > 0) {
+          await sendWhatsAppMessage(ADMIN_ARRAY[0], `⚠️ Ignored unstructured LR from ${from}\n\nMessage: ${message}`);
         }
         return res.sendStatus(200);
       }
@@ -557,11 +597,10 @@ app.post('/webhook', async (req, res) => {
         });
       } catch (err) {
         console.error("❌ PDF Error:", err.message);
-        if (ADMIN_NUMBERS.length > 0) {
-          await sendWhatsAppMessage(ADMIN_NUMBERS[0], `❌ Failed to generate/send PDF for ${from}`);
+        if (ADMIN_ARRAY.length > 0) {
+          await sendWhatsAppMessage(ADMIN_ARRAY[0], `❌ Failed to generate/send PDF for ${from}`);
         }
       }
-      if (!sentNumbers.includes(from)) sentNumbers.push(from);
     }
 
     return res.sendStatus(200);
@@ -572,7 +611,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 app.get('/sent-numbers', (req, res) => {
-  res.json({ sentNumbers });
+  res.json({ sentNumbers: [] });
 });
 
 const PORT = process.env.PORT || 8080;
