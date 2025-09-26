@@ -1,8 +1,6 @@
 // utils/lrExtractor.js
-// ChatGPT (gpt-5-mini) single-call LR extractor.
+// ChatGPT (gpt-5-mini) single-call LR extractor (patched).
 // Exports: extractDetails(message) and isStructuredLR(message)
-//
-// NOTE: prompt left exactly as you provided (no changes).
 
 'use strict';
 
@@ -124,7 +122,7 @@ Message:
 `.trim();
 }
 
-// ----------------- Single AI call -----------------
+// ----------------- Single AI call (patched) -----------------
 async function singleAiCall(prompt) {
   if (!API_KEY || !openai) {
     console.warn("[lrExtractor] No API key/client available: skipping AI call.");
@@ -132,21 +130,22 @@ async function singleAiCall(prompt) {
   }
 
   try {
-    // Use chat completions shape; support SDKs that use openai.chat.completions.create or client.responses
-    // The OpenAI node SDK has multiple shapes; attempt the chat.completions path first.
+    // 1) Older SDK shape: openai.chat.completions.create
     if (typeof openai.chat?.completions?.create === 'function') {
+      // NOTE: many modern models/SDKs reject `max_tokens` for chat completions; use `max_completion_tokens`
       const resp = await openai.chat.completions.create({
         model: MODEL_NAME,
         messages: [{ role: "user", content: prompt }],
-        max_tokens: 600,
+        max_completion_tokens: 600,
         temperature: 0
       });
+      // different SDKs place content in different paths — try common ones
       const choice = resp?.choices?.[0];
-      const content = choice?.message?.content || choice?.text || "";
+      const content = choice?.message?.content || choice?.text || choice?.delta?.content || "";
       return String(content || "");
     }
 
-    // fallback for newer SDK that exposes 'responses.create'
+    // 2) Newer SDK shape: openai.responses.create
     if (typeof openai.responses?.create === 'function') {
       const resp = await openai.responses.create({
         model: MODEL_NAME,
@@ -154,8 +153,34 @@ async function singleAiCall(prompt) {
         max_output_tokens: 600,
         temperature: 0
       });
-      // try multiple locations for text content
-      const text = (resp.output && Array.isArray(resp.output) && resp.output.map(o=>o.content?.map(c=>c.text).join('') || '').join('')) || resp.output_text || '';
+
+      // Extract text robustly from `resp`
+      // resp.output may be an array of { content: [{ type: 'output_text', text: '...' }, ...] }
+      let text = '';
+      try {
+        if (resp.output && Array.isArray(resp.output)) {
+          for (const item of resp.output) {
+            if (item.content && Array.isArray(item.content)) {
+              for (const c of item.content) {
+                // some SDKs use 'text', others 'content[0].text' or 'content[0].parts'
+                if (typeof c.text === 'string') text += c.text;
+                if (Array.isArray(c.parts)) text += c.parts.join('');
+                if (typeof c === 'string') text += c;
+              }
+            } else if (typeof item === 'string') {
+              text += item;
+            }
+          }
+        }
+      } catch (e) {
+        // fallback to output_text or output_text fields some SDKs provide
+        text = text || resp.output_text || resp.outputText || '';
+      }
+
+      // final fallback
+      if (!text && resp.output_text) text = resp.output_text;
+      if (!text && resp.outputText) text = resp.outputText;
+
       return String(text || '');
     }
 
@@ -163,7 +188,13 @@ async function singleAiCall(prompt) {
     console.warn("[lrExtractor] openai SDK shape unrecognized; skipping AI call.");
     return "";
   } catch (err) {
+    // log full error for debugging
     console.error("[lrExtractor] AI call error:", err && err.message ? err.message : String(err));
+    if (err && err.response && err.response.data) {
+      try { console.error("[lrExtractor] AI error response data:", JSON.stringify(err.response.data)); } catch(e){}
+    } else if (err && err.statusCode) {
+      console.error("[lrExtractor] AI error statusCode:", err.statusCode);
+    }
     return "";
   }
 }
