@@ -1,10 +1,29 @@
-const dotenv = require("dotenv");
-dotenv.config();
 
+---
+
+### ✅ Fix
+
+We need to **robustly clean the Gemini response** before parsing:
+
+1. Remove any backticks at the start or end.  
+2. Remove any `json` language hints.  
+3. Trim whitespace.  
+
+---
+
+Here’s the **full corrected code** with proper cleaning:
+
+```js
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 
-// 🔑 Directly using your API key (not from process.env)
-const genAI = new GoogleGenerativeAI("AIzaSyBTt-wdj0YsByntwscggZ0dDRzrc7Qmc7I");
+// 🔑 Your API Key (hardcoded)
+const API_KEY = "AIzaSyBTt-wdj0YsByntwscggZ0dDRzrc7Qmc7I";
+
+// 🔄 Choose which Gemini model to use
+const MODEL_NAME = "models/gemini-2.0-flash"; // or "models/gemini-2.0-pro"
+
+// Create Gemini client
+const genAI = new GoogleGenerativeAI(API_KEY);
 
 async function extractDetails(message) {
   console.log("📩 Received Message:", message);
@@ -12,7 +31,7 @@ async function extractDetails(message) {
   const prompt = `
 You are a smart logistics parser.
 
-Extract the following *mandatory* details from this message:
+Extract the following **mandatory** details from this message:
 
 - truckNumber (which may be 9 or 10 characters long, possibly containing spaces or hyphens) 
   Example: "MH 09 HH 4512" should be returned as "MH09HH4512"
@@ -20,7 +39,7 @@ Extract the following *mandatory* details from this message:
 - weight
 - description
 
-Also, extract the *optional* fields:
+Also, extract the **optional** fields:
 - from (this is optional but often present)
 - name (if the message contains a pattern like "n - name", "n-name", " n name", " n. name", or any variation where 'n' is followed by '-' or '.' or space, and then the person's name — extract the text after it as the name value)
 
@@ -51,24 +70,22 @@ Ensure the output is only the raw JSON — no extra text, notes, or formatting o
   try {
     console.log("⏳ Sending prompt to Gemini...");
 
-    const model = genAI.getGenerativeModel({
-      model: "models/gemini-2.0-flash",  // ✅ Using Gemini 2.0 Flash
-    });
-
+    const model = genAI.getGenerativeModel({ model: MODEL_NAME });
     const result = await model.generateContent(prompt);
 
-    // ✅ Safely extract text from Gemini response
     let resultText =
       result?.response?.candidates?.[0]?.content?.parts?.[0]?.text || "";
 
     console.log("📤 Raw Response from Gemini:\n", resultText);
 
-    // 🧼 Remove Markdown/code block formatting
+    // --- CLEAN RAW RESPONSE ---
     resultText = resultText.trim();
-    if (resultText.startsWith("")) {
-      resultText = resultText.replace(/(?:json)?/g, "").trim();
-    }
 
+    // Remove ```json or ``` at start/end
+    resultText = resultText.replace(/^```json\s*/i, "").replace(/^```\s*/i, "");
+    resultText = resultText.replace(/```$/, "").trim();
+
+    // --- PARSE JSON ---
     let extracted = {};
     try {
       extracted = JSON.parse(resultText);
@@ -81,11 +98,11 @@ Ensure the output is only the raw JSON — no extra text, notes, or formatting o
         to: "",
         weight: "",
         description: "",
-        name: ""
+        name: "",
       };
     }
 
-    // If truckNumber is empty, look for special phrases
+    // --- HANDLE SPECIAL PHRASES FOR truckNumber ---
     if (!extracted.truckNumber) {
       const lowerMsg = message.toLowerCase();
       if (lowerMsg.includes("new truck")) extracted.truckNumber = "new truck";
@@ -97,11 +114,14 @@ Ensure the output is only the raw JSON — no extra text, notes, or formatting o
       else if (lowerMsg.includes("bellgad")) extracted.truckNumber = "bellgad";
     }
 
-    // Normalize truckNumber if it's NOT one of the special phrases
-    if (extracted.truckNumber && !["new truck", "new tractor", "new gadi", "bellgadi", "bellgada", "bellgade", "bellgad"].includes(extracted.truckNumber.toLowerCase())) {
-      extracted.truckNumber = extracted.truckNumber
-        .replace(/[\s.-]/g, "")
-        .toUpperCase();
+    // Normalize truckNumber
+    if (
+      extracted.truckNumber &&
+      !["new truck", "new tractor", "new gadi", "bellgadi", "bellgada", "bellgade", "bellgad"].includes(
+        extracted.truckNumber.toLowerCase()
+      )
+    ) {
+      extracted.truckNumber = extracted.truckNumber.replace(/[\s.-]/g, "").toUpperCase();
     }
 
     // Capitalize helper
@@ -110,36 +130,40 @@ Ensure the output is only the raw JSON — no extra text, notes, or formatting o
       return str
         .toLowerCase()
         .split(" ")
-        .map(word => word.charAt(0).toUpperCase() + word.slice(1))
+        .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
         .join(" ");
     };
 
-    // Capitalize from, to, description, and name
+    // Capitalize fields
     if (extracted.from) extracted.from = capitalize(extracted.from);
     if (extracted.to) extracted.to = capitalize(extracted.to);
     if (extracted.description) extracted.description = capitalize(extracted.description);
     if (extracted.name) extracted.name = capitalize(extracted.name);
 
-    // Weight: if weight contains "fix" (case insensitive), keep as-is, else convert as number
+    // Weight handling
     if (extracted.weight) {
       if (/fix/i.test(extracted.weight)) {
         extracted.weight = extracted.weight.trim();
       } else {
         let weightNum = parseFloat(extracted.weight);
         if (!isNaN(weightNum)) {
-          if (weightNum > 0 && weightNum < 100) {
-            extracted.weight = Math.round(weightNum * 1000).toString();
-          } else {
-            extracted.weight = Math.round(weightNum).toString();
-          }
+          if (weightNum > 0 && weightNum < 100) extracted.weight = Math.round(weightNum * 1000).toString();
+          else extracted.weight = Math.round(weightNum).toString();
         }
       }
     }
 
     return extracted;
-
   } catch (error) {
     console.error("❌ Error in extractDetails:", error.message);
+    return {
+      truckNumber: "",
+      from: "",
+      to: "",
+      weight: "",
+      description: "",
+      name: "",
+    };
   }
 }
 
@@ -156,5 +180,19 @@ async function isStructuredLR(message) {
   console.log("✅ isStructuredLR:", isValid);
   return isValid;
 }
+
+// Example usage
+(async () => {
+  const testMsg = `Rj 27 GB 7961
+wt 30
+Mh to Mungana/choti sadri
+Tmt
+N.grp`;
+  const details = await extractDetails(testMsg);
+  console.log("🎯 Extracted Details:", details);
+
+  const valid = await isStructuredLR(testMsg);
+  console.log("Structured LR:", valid);
+})();
 
 module.exports = { extractDetails, isStructuredLR };
