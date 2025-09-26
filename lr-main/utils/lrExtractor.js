@@ -9,22 +9,23 @@ const MODEL_NAME = "models/gemini-2.0-flash";
 const genAI = new GoogleGenerativeAI(API_KEY);
 
 async function extractDetails(message) {
-  const prompt = `
+ const prompt = `
 You are a smart logistics parser.
 
-Extract the following **mandatory** details from this message:
+Extract the following *mandatory* details from this message:
 
 - truckNumber (which may be 9 or 10 characters long, possibly containing spaces or hyphens) 
+  Example: "MH 09 HH 4512" should be returned as "MH09HH4512"
 - to
 - weight
 - description
 
-Also, extract the **optional** fields:
-- from
-- name
+Also, extract the *optional* fields:
+- from (this is optional but often present)
+- name (if the message contains a pattern like "n - name", "n-name", " n name", " n. name", or any variation where 'n' is followed by '-' or '.' or space, and then the person's name — extract the text after it as the name value)
 
 If truckNumber is missing, but the message contains words like "brllgada","bellgade","bellgad","bellgadi","new truck", "new tractor", or "new gadi", 
-then set truckNumber to that phrase.
+then set truckNumber to that phrase (exactly as it appears).
 
 If the weight contains the word "fix" or similar, preserve it as-is.
 
@@ -34,17 +35,17 @@ Here is the message:
 Return the extracted information strictly in the following JSON format:
 
 {
-  "truckNumber": "",
-  "from": "",
-  "to": "",
-  "weight": "",
-  "description": "",
-  "name": ""
+  "truckNumber": "",    // mandatory
+  "from": "",           // optional
+  "to": "",             // mandatory
+  "weight": "",         // mandatory
+  "description": "",    // mandatory
+  "name": ""            // optional
 }
 
 If any field is missing, return it as an empty string.
 
-Ensure the output is only the raw JSON.
+Ensure the output is only the raw JSON — no extra text, notes, or formatting outside the JSON structure.
 `;
 
   try {
