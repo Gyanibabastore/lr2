@@ -8,7 +8,6 @@ const { normalizePhone } = require('./utils/phone');
 const subadminPath = path.join(__dirname, './subadmin.json');
 
 async function sendPDF(to, filePath, templateNumber = null, originalMessage = '', truckNumber = null) {
-  // ENV: PHONE_NUMBER_ID, WHATSAPP_TOKEN, ADMIN_NUMBER
   const phoneId = process.env.PHONE_NUMBER_ID;
   const token = process.env.WHATSAPP_TOKEN;
   const adminRaw = process.env.ADMIN_NUMBER;
