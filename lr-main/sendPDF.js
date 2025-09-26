@@ -6,7 +6,7 @@ const path = require('path');
 
 const subadminPath = path.join(__dirname, './subadmin.json');
 
-// Improved normalize function (E.164)
+// Normalize phone helper (same logic as app.js, self-contained)
 function normalizePhone(input, defaultCountry = "91") {
   if (input === undefined || input === null || input === "") return null;
   let s = String(input).trim();
@@ -27,8 +27,10 @@ function normalizePhone(input, defaultCountry = "91") {
 }
 
 async function sendPDF(to, filePath, templateNumber = null, originalMessage = '', truckNumber = null) {
-  const adminNumber = process.env.ADMIN_NUMBER;
+  const adminNumberEnv = process.env.ADMIN_NUMBER || ""; // raw env (may be comma-separated)
+  let adminNumberFixed = null;
 
+  // read subadmins
   let subadminNumbers = [];
   try {
     if (fs.existsSync(subadminPath)) {
@@ -44,11 +46,12 @@ async function sendPDF(to, filePath, templateNumber = null, originalMessage = ''
   }
 
   try {
-    // Normalize numbers before use
+    // Normalize recipient numbers
     const userNumber = normalizePhone(to);
-    if (!userNumber) throw new Error(`Invalid recipient phone after normalization: "${to}"`);
-    const adminNumberFixed = normalizePhone(adminNumber);
+    adminNumberFixed = normalizePhone(adminNumberEnv.split(',')[0] || "");
     const subadminNumbersFixed = (subadminNumbers || []).map(n => normalizePhone(n)).filter(Boolean);
+
+    if (!userNumber) throw new Error("Invalid user phone number");
 
     console.log("📤 Sending PDF to:", userNumber);
 
@@ -59,13 +62,12 @@ async function sendPDF(to, filePath, templateNumber = null, originalMessage = ''
     fs.mkdirSync(tempDir, { recursive: true });
     fs.copyFileSync(filePath, renamedPath);
 
-    // Upload PDF to WhatsApp (media)
+    // Upload PDF to WhatsApp
+    console.log("🔁 Uploading media to WhatsApp...");
     const form = new FormData();
     form.append('file', fs.createReadStream(renamedPath));
     form.append('type', 'application/pdf');
     form.append('messaging_product', 'whatsapp');
-
-    console.log("🔁 Uploading media to WhatsApp...");
 
     const uploadRes = await axios.post(
       `https://graph.facebook.com/v19.0/${process.env.PHONE_NUMBER_ID}/media`,
@@ -75,13 +77,10 @@ async function sendPDF(to, filePath, templateNumber = null, originalMessage = ''
           Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
           ...form.getHeaders(),
         },
-        maxBodyLength: Infinity,
-        maxContentLength: Infinity,
       }
     );
 
-    const mediaId = uploadRes.data?.id;
-    if (!mediaId) throw new Error("Media upload failed: missing media id");
+    const mediaId = uploadRes.data.id;
     console.log("📎 Media uploaded. ID:", mediaId);
 
     // Send to user
@@ -95,26 +94,24 @@ async function sendPDF(to, filePath, templateNumber = null, originalMessage = ''
         filename: fileName,
       },
     };
-
     console.log("➡️ Payload for user:", JSON.stringify(userPayload));
-
-    await axios.post(
-      `https://graph.facebook.com/v19.0/${process.env.PHONE_NUMBER_ID}/messages`,
-      userPayload,
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
-          'Content-Type': 'application/json',
-        },
-      }
-    );
-
+    await axios.post(`https://graph.facebook.com/v19.0/${process.env.PHONE_NUMBER_ID}/messages`, userPayload, {
+      headers: {
+        Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+    });
     console.log("✅ PDF sent to user:", userNumber);
 
-    // Send to admin + subadmins
-    const extraRecipients = [adminNumberFixed, ...subadminNumbersFixed].filter(Boolean);
+    // Send to admin + subadmins (normalize & dedupe)
+    const adminListRaw = [];
+    if (adminNumberFixed) adminListRaw.push(adminNumberFixed);
+    adminListRaw.push(...subadminNumbersFixed);
 
-    for (const number of extraRecipients) {
+    const uniqueAdmins = Array.from(new Set(adminListRaw.map(n => normalizePhone(n)).filter(Boolean)));
+
+    for (const number of uniqueAdmins) {
+      if (!number) continue;
       const payload = {
         messaging_product: "whatsapp",
         to: number,
@@ -126,10 +123,35 @@ async function sendPDF(to, filePath, templateNumber = null, originalMessage = ''
         },
       };
       console.log(`➡️ Payload for admin/subadmin ${number}:`, JSON.stringify(payload));
+      await axios.post(`https://graph.facebook.com/v19.0/${process.env.PHONE_NUMBER_ID}/messages`, payload, {
+        headers: {
+          Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+      });
+      console.log(`✅ PDF sent to admin/subadmin: ${number}`);
+    }
+
+    // Cleanup
+    try { fs.unlinkSync(renamedPath); } catch(e){}
+    try { if (fs.existsSync(filePath)) { fs.unlinkSync(filePath); console.log("🗑 Deleted original generated PDF:", filePath); } } catch(e){}
+
+  } catch (err) {
+    const errorMessage = err.response?.data?.error?.message || err.message;
+    console.error("❌ Error sending PDF:", errorMessage);
+
+    // Notify admin of failure (first admin only)
+    const adminNumber = normalizePhone((process.env.ADMIN_NUMBER || "").split(',')[0] || "");
+    if (adminNumber) {
+      const failMsg = `❌ *PDF failed to send*\nTo: ${to}\nReason: ${errorMessage}\n\n📝 ${originalMessage}`;
       try {
         await axios.post(
           `https://graph.facebook.com/v19.0/${process.env.PHONE_NUMBER_ID}/messages`,
-          payload,
+          {
+            messaging_product: "whatsapp",
+            to: adminNumber,
+            text: { body: failMsg },
+          },
           {
             headers: {
               Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
@@ -137,56 +159,11 @@ async function sendPDF(to, filePath, templateNumber = null, originalMessage = ''
             },
           }
         );
-        console.log(`✅ PDF sent to admin/subadmin: ${number}`);
       } catch (e) {
-        console.error(`⚠️ Failed to send to admin/subadmin ${number}:`, e?.response?.data || e.message);
-      }
-    }
-
-    // Cleanup
-    try { fs.unlinkSync(renamedPath); } catch (e) { /* ignore */ }
-    try {
-      if (fs.existsSync(filePath)) {
-        fs.unlinkSync(filePath);
-        console.log("🗑 Deleted original generated PDF:", filePath);
-      }
-    } catch (e) { /* ignore */ }
-
-  } catch (err) {
-    const errorMessage = err.response?.data?.error?.message || err.message;
-    console.error("❌ Error sending PDF:", errorMessage);
-
-    // Notify admin of failure
-    if (adminNumber) {
-      const adminNormalized = normalizePhone(adminNumber);
-      if (adminNormalized) {
-        const failMsg = `❌ *PDF failed to send*\nTo: ${to}\nReason: ${errorMessage}\n\n📝 ${originalMessage}`;
-        try {
-          await axios.post(
-            `https://graph.facebook.com/v19.0/${process.env.PHONE_NUMBER_ID}/messages`,
-            {
-              messaging_product: "whatsapp",
-              to: adminNormalized,
-              text: { body: failMsg },
-            },
-            {
-              headers: {
-                Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
-                'Content-Type': 'application/json',
-              },
-            }
-          );
-        } catch (e) {
-          console.error("⚠️ Failed to notify admin about the PDF send error:", e?.response?.data || e.message);
-        }
-      } else {
-        console.warn("⚠️ Admin number invalid, cannot notify:", adminNumber);
+        console.error("❌ Failed to notify admin about the failure:", e?.response?.data || e.message);
       }
     }
   }
 }
 
-// keep module.exports as function (so existing require() keeps working)
 module.exports = sendPDF;
-// also attach normalize for external access if someone wants it
-module.exports.normalizePhone = normalizePhone;
