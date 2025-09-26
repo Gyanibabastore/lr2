@@ -1,13 +1,24 @@
 // utils/lrExtractor.js
-// Improved AI-first LR extractor with robust strict-prompting, weight heuristics,
-// detailed console logging, and deterministic fallback.
-// Exports: extractDetails(message) and isStructuredLR(message)
+// AI-first LR extractor using Gemini with automatic model discovery (using your API key),
+// pre-check to skip AI for structured messages, retry/backoff that respects RetryInfo,
+// and deterministic fallback. Exports: extractDetails(message), isStructuredLR(message)
 
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 
-// --- Inline API key (kept as provided) ---
+// --- Inline API key (as provided by you) ---
 const API_KEY = "AIzaSyDCpWBb1e9rWrxELhM2ieqtH9ZNqLXKiPc";
-const MODEL_NAME = "models/gemini-2.0-flash";
+
+// Preferred model order (we will pick first available)
+const PREFERRED_MODELS = [
+  "models/gemini-2.0-flash",
+  "models/gemini-1.5-flash",
+  "models/gemini-1.5-pro",
+  "models/gemini-1.5"
+];
+
+let SELECTED_MODEL = null; // will be set by ensureModelSelected()
+let modelDiscoveryTried = false;
+let rateLimitResetTs = 0; // epoch ms until which AI calls should be skipped when quota/exhausted
 
 const genAI = new GoogleGenerativeAI(API_KEY);
 
@@ -72,7 +83,6 @@ function tryParseJsonFromText(text) {
 }
 
 // ----------------- Weight tokenization + heuristics -----------------
-// get numeric tokens with small context window
 function numericTokensWithContext(text) {
   const tokens = [];
   if (!text) return tokens;
@@ -88,29 +98,21 @@ function numericTokensWithContext(text) {
   }
   return tokens;
 }
-
-// detect if numeric token likely part of truck plate nearby
 function looksLikeTruckNumberToken(tokenRaw, fullMessage) {
   if (!tokenRaw) return false;
   const joined = fullMessage.replace(/\s+/g, "");
-  // naive check: presence of common plate pattern in message
   if (joined.match(/[A-Za-z]{2}\d{1,2}[A-Za-z]{1,3}\d{1,4}/)) {
-    // if this token appears immediately after letters in original message, consider truck
     if (new RegExp(`[A-Za-z]{2}\\s?\\d{1,2}\\s?[A-Za-z]{1,3}\\s?${tokenRaw}`, "i").test(fullMessage)) {
       return true;
     }
   }
-  // else conservatively return false
   return false;
 }
-
-// pick best weight candidate using heuristics
 function pickBestWeightCandidate(message) {
   const weightWords = ["wt","weight","kg","kgs","kilogram","kilograms","ton","tons","t","mt","quintal"];
   const tokens = numericTokensWithContext(message);
   if (!tokens.length) return "";
 
-  // prefer tokens near weight words
   const nearWeight = tokens.filter(t => {
     const ctx = t.context.toLowerCase();
     for (const w of weightWords) if (ctx.includes(w)) return true;
@@ -126,7 +128,6 @@ function pickBestWeightCandidate(message) {
     return nearWeight[0].num;
   }
 
-  // tokens that include unit suffix
   const withUnit = tokens.filter(t => /kg|kgs|mt|ton|t\b/.test(t.raw.toLowerCase()))
     .filter(t => !looksLikeTruckNumberToken(t.raw, message));
   if (withUnit.length) {
@@ -134,21 +135,18 @@ function pickBestWeightCandidate(message) {
     return withUnit[0].num;
   }
 
-  // tokens > 1000 and not truck-like
   const large = tokens.filter(t => parseFloat(t.num || 0) >= 1000 && !looksLikeTruckNumberToken(t.raw, message));
   if (large.length) {
     large.sort((a,b) => parseFloat(b.num) - parseFloat(a.num));
     return large[0].num;
   }
 
-  // fallback: largest non-truck token
   const nonTruck = tokens.filter(t => !looksLikeTruckNumberToken(t.raw, message));
   if (nonTruck.length) {
     nonTruck.sort((a,b) => parseFloat(b.num) - parseFloat(a.num));
     return nonTruck[0].num;
   }
 
-  // last resort: largest token
   tokens.sort((a,b) => parseFloat(b.num) - parseFloat(a.num));
   return tokens[0].num;
 }
@@ -167,7 +165,7 @@ function fallbackParse(message) {
   let description = "";
   let name = "";
 
-  // 1) Truck detection (Indian plate patterns or 6-10 alnum token)
+  // Truck detection
   for (const ln of lines) {
     const m = ln.match(/([A-Za-z]{2}\s?\d{1,2}\s?[A-Za-z]{1,3}\s?\d{1,4})/);
     if (m) {
@@ -184,31 +182,24 @@ function fallbackParse(message) {
     }
   }
 
-  // 2) from/to detection: "A to B", "A -> B"
+  // from/to
   for (const ln of lines) {
     const m = ln.match(/(.+?)\s*(?:to|->|→|–|—|-)\s*(.+)/i);
-    if (m) {
-      from = capitalize(m[1].trim());
-      to = capitalize(m[2].trim());
-      break;
-    }
+    if (m) { from = capitalize(m[1].trim()); to = capitalize(m[2].trim()); break; }
   }
 
-  // 3) weight detection using heuristics
+  // weight using heuristics
   if (!weight) {
     const joined = lines.join(" ");
     const candidate = pickBestWeightCandidate(joined);
     if (candidate) weight = parseNumberLike(candidate);
   }
 
-  // 4) description detection: prefer goodsKeywords match
+  // description
   for (const ln of lines) {
     const low = ln.toLowerCase();
     for (const kw of goodsKeywords) {
-      if (low.includes(kw)) {
-        description = capitalize(ln);
-        break;
-      }
+      if (low.includes(kw)) { description = capitalize(ln); break; }
     }
     if (description) break;
   }
@@ -220,7 +211,7 @@ function fallbackParse(message) {
     }
   }
 
-  // 5) name detection: patterns like "n - name" or "name: X"
+  // name
   for (const ln of lines) {
     const m = ln.match(/\b[nN]\s*[\-.:]?\s*(.+)$/);
     if (m) { name = capitalize(m[1].trim()); break; }
@@ -228,40 +219,104 @@ function fallbackParse(message) {
     if (m2) { name = capitalize(m2[1].trim()); break; }
   }
 
-  // 6) special phrase truckNumber
+  // special phrases
   const lower = String(message || "").toLowerCase();
   if (!truckNumber) {
     const specials = ['new truck','new tractor','new gadi','bellgadi','bellgada','bellgade','bellgad','brllgada'];
     for (const s of specials) if (lower.includes(s)) { truckNumber = s; break; }
   }
 
-  return {
-    truckNumber: truckNumber || "",
-    from: from || "",
-    to: to || "",
-    weight: weight || "",
-    description: description || "",
-    name: name || ""
-  };
+  return { truckNumber, from, to, weight, description, name };
 }
 
-// ----------------- Low-level AI call (returns text) -----------------
-async function aiCall(prompt) {
+// ----------------- Model discovery -----------------
+// Attempt to list models using the REST endpoint (using API key) and pick first preferred
+async function ensureModelSelected() {
+  if (SELECTED_MODEL || modelDiscoveryTried) return;
+  modelDiscoveryTried = true;
   try {
-    const model = genAI.getGenerativeModel ? genAI.getGenerativeModel({ model: MODEL_NAME }) : null;
-    if (model && typeof model.generateContent === "function") {
-      const result = await model.generateContent(prompt, { temperature: 0, maxOutputTokens: 512 });
+    console.log("[lrExtractor] Discovering available models via REST listModels...");
+    const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${API_KEY}`;
+    // Node 18+ has global fetch; if not available, user must polyfill
+    const resp = await fetch(url, { method: "GET" });
+    if (!resp.ok) {
+      console.warn("[lrExtractor] listModels HTTP error:", resp.status, await resp.text());
+      // fallback to preferred order first item
+      SELECTED_MODEL = PREFERRED_MODELS[0];
+      console.log("[lrExtractor] Falling back to default model:", SELECTED_MODEL);
+      return;
+    }
+    const body = await resp.json();
+    const available = (body.models || []).map(m => m.name || m.model || m.id).filter(Boolean);
+    console.log("[lrExtractor] Available models:", available);
+    for (const pref of PREFERRED_MODELS) {
+      if (available.includes(pref)) {
+        SELECTED_MODEL = pref;
+        break;
+      }
+    }
+    if (!SELECTED_MODEL) {
+      // pick first available or fallback to first preferred
+      SELECTED_MODEL = available.length ? available[0] : PREFERRED_MODELS[0];
+    }
+    console.log("[lrExtractor] Selected model:", SELECTED_MODEL);
+  } catch (e) {
+    console.error("[lrExtractor] model discovery failed:", e && e.message ? e.message : e);
+    SELECTED_MODEL = PREFERRED_MODELS[0];
+    console.log("[lrExtractor] Falling back to default model:", SELECTED_MODEL);
+  }
+}
+
+// ----------------- Low-level AI call with rate-limit respect -----------------
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function aiCallWithRateLimit(prompt) {
+  // If server previously told us to wait, skip AI call
+  if (Date.now() < rateLimitResetTs) {
+    console.warn("[lrExtractor] Skipping AI call due to rate-limit until", new Date(rateLimitResetTs));
+    return "";
+  }
+
+  // ensure we have selected a model
+  await ensureModelSelected();
+
+  // Prepare call using genAI + selected model
+  try {
+    const modelObj = genAI.getGenerativeModel ? genAI.getGenerativeModel({ model: SELECTED_MODEL }) : null;
+    if (modelObj && typeof modelObj.generateContent === "function") {
+      const result = await modelObj.generateContent(prompt, { temperature: 0, maxOutputTokens: 512 });
       return result?.response?.candidates?.[0]?.content?.parts?.[0]?.text || "";
     }
     if (typeof genAI.generate === "function") {
-      const resp = await genAI.generate({ prompt, temperature: 0, maxOutputTokens: 512 });
+      const resp = await genAI.generate({ prompt, temperature: 0, maxOutputTokens: 512, model: SELECTED_MODEL });
       return resp?.text || "";
     }
     return "";
-  } catch (e) {
-    console.error("[lrExtractor] aiCall error:", e && e.message ? e.message : e);
+  } catch (err) {
+    const msg = err && err.message ? err.message : String(err);
+    console.error("[lrExtractor] aiCall error:", msg);
+
+    // try to extract retryDelay from error message
+    const retryMatch = msg.match(/"retryDelay"\s*:\s*"?(\d+)\s*s"?/i) || msg.match(/Please retry in\s*([0-9.]+)s/i);
+    if (retryMatch) {
+      const sec = parseInt(retryMatch[1], 10);
+      if (!isNaN(sec)) {
+        rateLimitResetTs = Date.now() + (sec + 1) * 1000;
+        console.warn(`[lrExtractor] API returned RetryInfo -> skipping AI until ${new Date(rateLimitResetTs)}`);
+      }
+    }
     return "";
   }
+}
+
+// ----------------- Quick structured-check to avoid AI (saves quota) -----------------
+function looksStructuredFast(msg) {
+  if (!msg) return false;
+  const lc = msg.toLowerCase();
+  const hasWeightToken = /(wt|weight|kgs?|kg|mt|ton)/.test(lc);
+  const hasPlate = /[A-Za-z]{2}\s?\d{1,2}\s?[A-Za-z]{1,3}\s?\d{1,4}/.test(msg);
+  const hasWtNum = /(wt|weight)\s*[:\-]?\s*[0-9]{2,7}/i.test(msg);
+  return hasWeightToken && (hasPlate || hasWtNum);
 }
 
 // ----------------- Prompt builder (strict) -----------------
@@ -291,14 +346,37 @@ async function extractDetails(message) {
     return { truckNumber: "", from: "", to: "", weight: "", description: "", name: "" };
   }
 
+  // Quick structured check -> fallback skip AI
+  if (looksStructuredFast(message)) {
+    console.log("[lrExtractor] Message appears structured -> skipping AI and using fallbackParse");
+    const fb = fallbackParse(message);
+    // Normalize fallback fields (same normalization as AI path)
+    const specials = ["new truck","new tractor","new gadi","bellgadi","bellgada","bellgade","bellgad","brllgada"];
+    if (fb.truckNumber && !specials.includes(fb.truckNumber.toLowerCase())) fb.truckNumber = normalizeTruck(fb.truckNumber);
+    if (fb.from) fb.from = capitalize(fb.from);
+    if (fb.to) fb.to = capitalize(fb.to);
+    if (fb.description) fb.description = capitalize(fb.description);
+    if (fb.name) fb.name = capitalize(fb.name);
+    if (fb.weight && !/fix/i.test(fb.weight)) {
+      const wn2 = String(fb.weight).replace(/,/g,"");
+      const n2 = parseFloat(wn2);
+      if (!isNaN(n2)) {
+        if (n2 > 0 && n2 < 100) fb.weight = Math.round(n2 * 1000).toString();
+        else fb.weight = Math.round(n2).toString();
+      }
+    }
+    console.log("[lrExtractor] Final parsed (fallback-fast). Took(ms):", Date.now()-startTs, "Result:", fb);
+    return fb;
+  }
+
   const promptBase = buildStrictPrompt(message);
 
-  // try AI up to 3 attempts with small nudges
+  // try AI up to 3 attempts with small nudges but using aiCallWithRateLimit
   for (let attempt = 0; attempt < 3; attempt++) {
     const attemptNote = attempt === 0 ? "" : attempt === 1 ? "\nNOTE: Return JSON only, ensure keys exist." : "\nFINAL: If unsure, leave empty.";
     const prompt = promptBase + attemptNote;
     console.log(`[lrExtractor] AI attempt ${attempt+1} - sending prompt (first 200 chars):`, prompt.slice(0,200).replace(/\n/g,' '));
-    const aiText = await aiCall(prompt);
+    const aiText = await aiCallWithRateLimit(prompt);
     if (!aiText) {
       console.log(`[lrExtractor] AI attempt ${attempt+1} returned empty response.`);
       continue;
@@ -352,10 +430,10 @@ async function extractDetails(message) {
   }
 
   // if AI failed all attempts -> use fallback
-  console.warn("[lrExtractor] AI failed to produce valid JSON after 3 attempts — running deterministic fallback.");
+  console.warn("[lrExtractor] AI failed to produce valid JSON after attempts — running deterministic fallback.");
   const fb = fallbackParse(message);
 
-  // Normalize truck unless special
+  // Normalize fallback
   if (fb.truckNumber && !["new truck","new tractor","new gadi","bellgadi","bellgada","bellgade","bellgad","brllgada"].includes(fb.truckNumber.toLowerCase())) {
     fb.truckNumber = normalizeTruck(fb.truckNumber);
   }
@@ -363,16 +441,12 @@ async function extractDetails(message) {
   if (fb.to) fb.to = capitalize(fb.to);
   if (fb.description) fb.description = capitalize(fb.description);
   if (fb.name) fb.name = capitalize(fb.name);
-
-  // Weight normalization (preserve 'fix')
   if (fb.weight && !/fix/i.test(fb.weight)) {
     const wn2 = String(fb.weight).replace(/,/g,"");
     const n2 = parseFloat(wn2);
     if (!isNaN(n2)) {
       if (n2 > 0 && n2 < 100) fb.weight = Math.round(n2 * 1000).toString();
       else fb.weight = Math.round(n2).toString();
-    } else {
-      fb.weight = fb.weight;
     }
   }
 
