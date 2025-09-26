@@ -35,7 +35,8 @@ if (!API_KEY) {
 }
 
 // ----------------- Model / settings -----------------
-const SELECTED_MODEL = "gpt-5-nano";
+const SELECTED_MODEL = "gpt-5-small";
+
 let rateLimitResetTs = 0;
 
 // For reproducible empty return
