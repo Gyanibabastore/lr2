@@ -35,7 +35,7 @@ if (!API_KEY) {
 }
 
 // ----------------- Model / settings -----------------
-const SELECTED_MODEL = "gpt-5-small";
+const SELECTED_MODEL = "gpt-5-mini";
 
 let rateLimitResetTs = 0;
 
