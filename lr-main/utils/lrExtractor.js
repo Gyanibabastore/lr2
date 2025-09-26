@@ -1,5 +1,6 @@
 // utils/lrExtractor.js
 // OpenAI-based LR extractor that mirrors the Gemini behaviour & post-processing you provided.
+// Added: verbose console logging of raw model response + cleaned text + parsing result.
 // Exports: extractDetails(message) and isStructuredLR(message)
 
 'use strict';
@@ -73,15 +74,10 @@ Ensure the output is only the raw JSON — no extra text, notes, or formatting o
 
 // ---------------- Robustly extract text from OpenAI responses ----------------
 async function extractTextFromResponse(resp) {
-  // resp can be the return value of chat.completions.create or responses.create
-  // We try multiple common shapes.
   try {
-    // chat.completions.create shape
     if (resp && resp.choices && Array.isArray(resp.choices) && resp.choices[0]) {
       const choice = resp.choices[0];
-      // message content
       if (choice.message && (choice.message.content || choice.message?.content?.[0])) {
-        // some SDKs: choice.message.content is string, others nested
         if (typeof choice.message.content === 'string') return choice.message.content;
         if (Array.isArray(choice.message.content)) return choice.message.content.map(c=>c.text||'').join('');
       }
@@ -89,7 +85,6 @@ async function extractTextFromResponse(resp) {
       if (choice.delta && choice.delta.content) return choice.delta.content;
     }
 
-    // newer responses.create shape
     if (resp && resp.output && Array.isArray(resp.output)) {
       let out = '';
       for (const item of resp.output) {
@@ -107,10 +102,9 @@ async function extractTextFromResponse(resp) {
       if (out) return out;
     }
 
-    // fallback: try resp.output_text or resp.output_text
     if (resp && (resp.output_text || resp.outputText)) return resp.output_text || resp.outputText;
   } catch (e) {
-    // ignore and return empty
+    // ignore
   }
   return '';
 }
@@ -119,41 +113,29 @@ async function extractTextFromResponse(resp) {
 function stripFormatting(text) {
   if (!text) return '';
   let t = String(text).trim();
-  // remove triple backtick code fences and leading language tags
+  // remove triple backtick fences
   t = t.replace(/^\s*```[\w\s]*\n?/, '');
   t = t.replace(/\n?```\s*$/, '');
-  // remove leading "```json" or similar occurrences anywhere
+  // remove ```json labels
   t = t.replace(/```json/g, '');
-  // remove possible "JSON:" or "Output:" prefixes
-  t = t.replace(/^[\s\S]*?{/, function(m){ // try to find first { and slice before it
-    // but we only want to if there's junk before
-    return m.includes('{') ? m : m;
-  });
-  // trim again
-  t = t.trim();
-  return t;
+  // Try to keep only the JSON block if there is pre/post text
+  const firstBrace = t.indexOf('{');
+  const lastBrace = t.lastIndexOf('}');
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    t = t.slice(firstBrace, lastBrace + 1);
+  }
+  return t.trim();
 }
 
 // ---------------- parse JSON safely ----------------
 function tryParseJsonFromText(text) {
   if (!text) return null;
   let txt = String(text).trim();
-  // Remove common wrappers
   txt = txt.replace(/^\ufeff/, ''); // BOM
-  // If text contains markdown fences, strip them
-  if (/```/.test(txt)) {
-    // remove everything before first { and after last }
-    const first = txt.indexOf('{');
-    const last = txt.lastIndexOf('}');
-    if (first >= 0 && last > first) txt = txt.slice(first, last + 1);
-    txt = txt.replace(/```/g,'').trim();
-  }
-  // try direct parse
   try {
     const j = JSON.parse(txt);
     if (j && typeof j === 'object') return j;
   } catch (e) {
-    // try to extract first {...} block
     const first = txt.indexOf('{'), last = txt.lastIndexOf('}');
     if (first >= 0 && last > first) {
       try {
@@ -173,11 +155,10 @@ function normalizeTruckNumber(raw) {
   const lower = s.toLowerCase();
   const specials = ["new truck","new tractor","new gadi","bellgadi","bellgada","bellgade","bellgad"];
   for (const p of specials) if (lower.includes(p)) return p;
-  // else strip non-alphanumeric and uppercase
   return s.replace(/[\s\.\-]/g, '').toUpperCase();
 }
 
-// ---------------- Capitalize helper (same as Gemini code) ----------------
+// ---------------- Capitalize helper ----------------
 function capitalize(str) {
   if (!str) return "";
   return String(str || "").toLowerCase().split(/\s+/).map(word => {
@@ -229,15 +210,23 @@ async function extractDetails(message) {
 
   for (let i=1; i<=Math.max(1, LR_RETRIES); i++) {
     const prompt = (i === 1) ? basePrompt : (basePrompt + `\n\nIMPORTANT (Attempt ${i}): If you failed to return JSON previously, return ONLY the JSON object now with no extra text.`);
+
+    // ---- call model ----
     aiText = await modelCall(prompt);
+
+    // ---- LOG: raw model response ----
+    console.log(`\n[lrExtractor] Raw model response (attempt ${i}):\n${aiText}\n`);
 
     if (!aiText) {
       console.warn(`[lrExtractor] Model returned empty on attempt ${i}.`);
       continue;
     }
 
-    // strip formatting and attempt parse
-    let cleaned = stripFormatting(aiText);
+    // ---- LOG: cleaned (stripped) text ----
+    const cleaned = stripFormatting(aiText);
+    console.log(`[lrExtractor] Cleaned response (attempt ${i}):\n${cleaned}\n`);
+
+    // ---- try parse ----
     parsed = tryParseJsonFromText(cleaned);
 
     if (parsed && typeof parsed === 'object') {
@@ -250,7 +239,7 @@ async function extractDetails(message) {
       parsed.description = safeString(parsed.description || "");
       parsed.name = safeString(parsed.name || "");
 
-      // If truckNumber empty, check message for special phrases (same logic as your Gemini code)
+      // If truckNumber empty, check message for special phrases
       if (!parsed.truckNumber) {
         const lowerMsg = String(message).toLowerCase();
         if (lowerMsg.includes("new truck")) parsed.truckNumber = "new truck";
@@ -268,24 +257,38 @@ async function extractDetails(message) {
         parsed.truckNumber = parsed.truckNumber.replace(/[\s\.\-]/g, '').toUpperCase();
       }
 
-      // Capitalize from/to/description/name
+      // ===== NEW: If from empty but to contains origin-destination pair, split it =====
+      if ((!parsed.from || parsed.from.trim() === "") && parsed.to) {
+        const td = parsed.to.trim();
+        let splitMatch = td.match(/^(.+?)[\s\-–—]+(.+)$/);
+        if (!splitMatch) splitMatch = td.match(/^(.+?)\s+to\s+(.+)$/i);
+        if (splitMatch) {
+          let origin = splitMatch[1].trim();
+          let dest = splitMatch[2].trim();
+          origin = origin.replace(/^[\:\-]+|[\:\-]+$/g,'').trim();
+          dest = dest.replace(/^[\:\-]+|[\:\-]+$/g,'').trim();
+          if (origin) parsed.from = origin;
+          if (dest) parsed.to = dest;
+          console.log(`[lrExtractor] Split 'to' into from='${parsed.from}' and to='${parsed.to}'`);
+        }
+      }
+
+      // Capitalize fields
       if (parsed.from) parsed.from = capitalize(parsed.from);
       if (parsed.to) parsed.to = capitalize(parsed.to);
       if (parsed.description) parsed.description = capitalize(parsed.description);
       if (parsed.name) parsed.name = capitalize(parsed.name);
 
-      // Weight handling: mirror Gemini logic exactly
+      // Weight handling (mirror Gemini)
       if (parsed.weight) {
         if (/fix/i.test(parsed.weight)) {
           parsed.weight = parsed.weight.trim();
         } else {
-          // Try to parse a float out of the weight string
           const numMatch = String(parsed.weight).trim().match(/-?\d+(\.\d+)?/);
           if (numMatch) {
             const weightNum = parseFloat(numMatch[0]);
             if (!isNaN(weightNum)) {
               if (weightNum > 0 && weightNum < 100) {
-                // multiply by 1000 and round (same as Gemini)
                 parsed.weight = Math.round(weightNum * 1000).toString();
               } else {
                 parsed.weight = Math.round(weightNum).toString();
@@ -302,7 +305,7 @@ async function extractDetails(message) {
       console.log("[lrExtractor] Parsed result (from model) on attempt", i, parsed);
       return parsed;
     } else {
-      console.warn(`[lrExtractor] Model returned unparsable/non-JSON on attempt ${i}. Raw:`, String(aiText).slice(0,1000));
+      console.warn(`[lrExtractor] Model returned unparsable/non-JSON on attempt ${i}. Raw cleaned text shown above.`);
       // continue if retries allowed
     }
   }
