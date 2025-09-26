@@ -6,7 +6,7 @@ const { GoogleGenerativeAI } = require("@google/generative-ai");
 
 // --- API key: prefer env var; if you want inline default, replace the empty string or put your key.
 // SECURITY: recommended to set process.env.GEMINI_API_KEY instead of hardcoding.
-const API_KEY = process.env.GEMINI_API_KEY || "AIzaSyDCpWBb1e9rWrxELhM2ieqtH9ZNqLXKiPc"; // <-- set this in .env or your environment
+const API_KEY = "AIzaSyDCpWBb1e9rWrxELhM2ieqtH9ZNqLXKiPc";
 
 // Preferred model order (first available will be selected)
 const PREFERRED_MODELS = [
