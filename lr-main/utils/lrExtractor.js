@@ -1,6 +1,6 @@
 // utils/lrExtractor.js
-// LR extractor (single-call by default). Retries controlled by LR_RETRIES env var.
-// Uses model specified in LR_MODEL (default gpt-4o). No local fallback — returns empty fields if model fails.
+// OpenAI-based LR extractor that mirrors the Gemini behaviour & post-processing you provided.
+// Exports: extractDetails(message) and isStructuredLR(message)
 
 'use strict';
 try { require('dotenv').config(); } catch (e) { /* ignore */ }
@@ -28,13 +28,13 @@ const safeString = v => (v === undefined || v === null) ? "" : String(v).trim();
 const maskKey = k => { if(!k) return '<missing>'; const s=String(k); return s.length<=12? s : s.slice(0,6)+'...'+s.slice(-4); };
 if (API_KEY) console.log("[lrExtractor] API key preview:", maskKey(API_KEY), " Model:", MODEL_NAME, "Retries:", LR_RETRIES);
 
-// ---------------- prompt builder (user's exact requirements embedded) ----------------
+// ---------------- Build the prompt (your Gemini prompt verbatim) ----------------
 function buildStrictPrompt(message) {
   const safeMessage = String(message || "").replace(/"/g, '\\"').replace(/\r/g, '\n');
   return `
 You are a smart logistics parser.
 
-Extract the following mandatory details from this message:
+Extract the following *mandatory* details from this message:
 
 - truckNumber (which may be 9 or 10 characters long, possibly containing spaces or hyphens) 
   Example: "MH 09 HH 4512" should be returned as "MH09HH4512"
@@ -42,7 +42,7 @@ Extract the following mandatory details from this message:
 - weight
 - description
 
-Also, extract the optional fields:
+Also, extract the *optional* fields:
 - from (this is optional but often present)
 - name (if the message contains a pattern like "n - name", "n-name", " n name", " n. name", or any variation where 'n' is followed by '-' or '.' or space, and then the person's name — extract the text after it as the name value)
 
@@ -54,51 +54,139 @@ If the weight contains the word "fix" or similar, preserve it as-is.
 Here is the message:
 "${safeMessage}"
 
-Return the extracted information strictly in the following JSON format (ONLY the JSON, nothing else):
+Return the extracted information strictly in the following JSON format:
 
 {
-  "truckNumber": "",
-  "from": "",
-  "to": "",
-  "weight": "",
-  "description": "",
-  "name": ""
+  "truckNumber": "",    // mandatory
+  "from": "",           // optional
+  "to": "",             // mandatory
+  "weight": "",         // mandatory
+  "description": "",    // mandatory
+  "name": ""            // optional
 }
 
 If any field is missing, return it as an empty string.
 
-Important: Do not include any commentary, explanation, markdown, or text outside the JSON object. Only return the raw JSON object.
+Ensure the output is only the raw JSON — no extra text, notes, or formatting outside the JSON structure.
 `.trim();
 }
 
-// ---------------- parse model output into JSON (robust) ----------------
+// ---------------- Robustly extract text from OpenAI responses ----------------
+async function extractTextFromResponse(resp) {
+  // resp can be the return value of chat.completions.create or responses.create
+  // We try multiple common shapes.
+  try {
+    // chat.completions.create shape
+    if (resp && resp.choices && Array.isArray(resp.choices) && resp.choices[0]) {
+      const choice = resp.choices[0];
+      // message content
+      if (choice.message && (choice.message.content || choice.message?.content?.[0])) {
+        // some SDKs: choice.message.content is string, others nested
+        if (typeof choice.message.content === 'string') return choice.message.content;
+        if (Array.isArray(choice.message.content)) return choice.message.content.map(c=>c.text||'').join('');
+      }
+      if (choice.text) return choice.text;
+      if (choice.delta && choice.delta.content) return choice.delta.content;
+    }
+
+    // newer responses.create shape
+    if (resp && resp.output && Array.isArray(resp.output)) {
+      let out = '';
+      for (const item of resp.output) {
+        if (!item) continue;
+        if (item.content && Array.isArray(item.content)) {
+          for (const c of item.content) {
+            if (typeof c.text === 'string') out += c.text;
+            else if (Array.isArray(c.parts)) out += c.parts.join('');
+            else if (typeof c === 'string') out += c;
+          }
+        } else if (typeof item === 'string') {
+          out += item;
+        }
+      }
+      if (out) return out;
+    }
+
+    // fallback: try resp.output_text or resp.output_text
+    if (resp && (resp.output_text || resp.outputText)) return resp.output_text || resp.outputText;
+  } catch (e) {
+    // ignore and return empty
+  }
+  return '';
+}
+
+// ---------------- strip common markdown/code block wrappers ----------------
+function stripFormatting(text) {
+  if (!text) return '';
+  let t = String(text).trim();
+  // remove triple backtick code fences and leading language tags
+  t = t.replace(/^\s*```[\w\s]*\n?/, '');
+  t = t.replace(/\n?```\s*$/, '');
+  // remove leading "```json" or similar occurrences anywhere
+  t = t.replace(/```json/g, '');
+  // remove possible "JSON:" or "Output:" prefixes
+  t = t.replace(/^[\s\S]*?{/, function(m){ // try to find first { and slice before it
+    // but we only want to if there's junk before
+    return m.includes('{') ? m : m;
+  });
+  // trim again
+  t = t.trim();
+  return t;
+}
+
+// ---------------- parse JSON safely ----------------
 function tryParseJsonFromText(text) {
   if (!text) return null;
-  const txt = String(text).trim();
+  let txt = String(text).trim();
+  // Remove common wrappers
+  txt = txt.replace(/^\ufeff/, ''); // BOM
+  // If text contains markdown fences, strip them
+  if (/```/.test(txt)) {
+    // remove everything before first { and after last }
+    const first = txt.indexOf('{');
+    const last = txt.lastIndexOf('}');
+    if (first >= 0 && last > first) txt = txt.slice(first, last + 1);
+    txt = txt.replace(/```/g,'').trim();
+  }
+  // try direct parse
   try {
     const j = JSON.parse(txt);
     if (j && typeof j === 'object') return j;
   } catch (e) {
+    // try to extract first {...} block
     const first = txt.indexOf('{'), last = txt.lastIndexOf('}');
     if (first >= 0 && last > first) {
-      const sub = txt.slice(first, last + 1);
-      try { const j2 = JSON.parse(sub); if (j2 && typeof j2 === 'object') return j2; } catch (e2) {}
+      try {
+        const sub = txt.slice(first, last + 1);
+        const j2 = JSON.parse(sub);
+        if (j2 && typeof j2 === 'object') return j2;
+      } catch (e2) { /* fallthrough */ }
     }
   }
   return null;
 }
 
-// ---------------- normalize truck number as per user's example ----------------
+// ---------------- normalize truck number ----------------
 function normalizeTruckNumber(raw) {
   if (!raw) return "";
-  const s = String(raw).trim();
-  const specialPattern = /\b(brllgada|bellgade|bellgad|bellgadi|new truck|new tractor|new gadi)\b/i;
-  const m = s.match(specialPattern);
-  if (m) return m[0];
-  return s.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+  let s = String(raw).trim();
+  const lower = s.toLowerCase();
+  const specials = ["new truck","new tractor","new gadi","bellgadi","bellgada","bellgade","bellgad"];
+  for (const p of specials) if (lower.includes(p)) return p;
+  // else strip non-alphanumeric and uppercase
+  return s.replace(/[\s\.\-]/g, '').toUpperCase();
 }
 
-// ---------------- single AI request (handles both SDK shapes) ----------------
+// ---------------- Capitalize helper (same as Gemini code) ----------------
+function capitalize(str) {
+  if (!str) return "";
+  return String(str || "").toLowerCase().split(/\s+/).map(word => {
+    if (!word) return '';
+    return word.charAt(0).toUpperCase() + word.slice(1);
+  }).filter(Boolean).join(' ');
+}
+
+// ---------------- single model call ----------------
 async function modelCall(prompt) {
   if (!API_KEY || !openai) {
     console.warn("[lrExtractor] No API key/client available: skipping AI call.");
@@ -109,30 +197,14 @@ async function modelCall(prompt) {
       const params = { model: MODEL_NAME, messages: [{ role: "user", content: prompt }], max_completion_tokens: 600 };
       if (supportsSampling) params.temperature = 0;
       const resp = await openai.chat.completions.create(params);
-      const choice = resp?.choices?.[0];
-      return String(choice?.message?.content || choice?.text || choice?.delta?.content || "" || "");
+      return await extractTextFromResponse(resp);
     }
 
     if (typeof openai.responses?.create === 'function') {
       const params = { model: MODEL_NAME, input: prompt, max_output_tokens: 600 };
       if (supportsSampling) params.temperature = 0;
       const resp = await openai.responses.create(params);
-      let text = '';
-      if (resp.output && Array.isArray(resp.output)) {
-        for (const item of resp.output) {
-          if (item.content && Array.isArray(item.content)) {
-            for (const c of item.content) {
-              if (typeof c.text === 'string') text += c.text;
-              if (Array.isArray(c.parts)) text += c.parts.join('');
-              if (typeof c === 'string') text += c;
-            }
-          } else if (typeof item === 'string') {
-            text += item;
-          }
-        }
-      }
-      if (!text) text = resp.output_text || resp.outputText || '';
-      return String(text || '');
+      return await extractTextFromResponse(resp);
     }
 
     console.warn("[lrExtractor] openai SDK shape unrecognized; skipping AI call.");
@@ -155,22 +227,22 @@ async function extractDetails(message) {
   let aiText = "";
   let parsed = null;
 
-  // Attempt loop — by default LR_RETRIES = 1 so only one call will happen.
   for (let i=1; i<=Math.max(1, LR_RETRIES); i++) {
-    // On retries we add a short note requesting strict JSON (keeps model focused)
     const prompt = (i === 1) ? basePrompt : (basePrompt + `\n\nIMPORTANT (Attempt ${i}): If you failed to return JSON previously, return ONLY the JSON object now with no extra text.`);
-
     aiText = await modelCall(prompt);
 
     if (!aiText) {
       console.warn(`[lrExtractor] Model returned empty on attempt ${i}.`);
-      // If LR_RETRIES==1, loop ends and we return empty fields below.
       continue;
     }
 
-    parsed = tryParseJsonFromText(aiText);
+    // strip formatting and attempt parse
+    let cleaned = stripFormatting(aiText);
+    parsed = tryParseJsonFromText(cleaned);
+
     if (parsed && typeof parsed === 'object') {
-      // ensure all fields exist, normalize truck
+      // bring to shape & post-process (match your Gemini code)
+      // ensure fields exist
       parsed.truckNumber = safeString(parsed.truckNumber || "");
       parsed.from = safeString(parsed.from || "");
       parsed.to = safeString(parsed.to || "");
@@ -178,16 +250,63 @@ async function extractDetails(message) {
       parsed.description = safeString(parsed.description || "");
       parsed.name = safeString(parsed.name || "");
 
-      parsed.truckNumber = normalizeTruckNumber(parsed.truckNumber);
+      // If truckNumber empty, check message for special phrases (same logic as your Gemini code)
+      if (!parsed.truckNumber) {
+        const lowerMsg = String(message).toLowerCase();
+        if (lowerMsg.includes("new truck")) parsed.truckNumber = "new truck";
+        else if (lowerMsg.includes("new tractor")) parsed.truckNumber = "new tractor";
+        else if (lowerMsg.includes("new gadi")) parsed.truckNumber = "new gadi";
+        else if (lowerMsg.includes("bellgadi")) parsed.truckNumber = "bellgadi";
+        else if (lowerMsg.includes("bellgada")) parsed.truckNumber = "bellgada";
+        else if (lowerMsg.includes("bellgade")) parsed.truckNumber = "bellgade";
+        else if (lowerMsg.includes("bellgad")) parsed.truckNumber = "bellgad";
+      }
+
+      // Normalize truckNumber if not special phrase
+      const lowerTruck = String(parsed.truckNumber || "").toLowerCase();
+      if (parsed.truckNumber && !["new truck","new tractor","new gadi","bellgadi","bellgada","bellgade","bellgad"].includes(lowerTruck)) {
+        parsed.truckNumber = parsed.truckNumber.replace(/[\s\.\-]/g, '').toUpperCase();
+      }
+
+      // Capitalize from/to/description/name
+      if (parsed.from) parsed.from = capitalize(parsed.from);
+      if (parsed.to) parsed.to = capitalize(parsed.to);
+      if (parsed.description) parsed.description = capitalize(parsed.description);
+      if (parsed.name) parsed.name = capitalize(parsed.name);
+
+      // Weight handling: mirror Gemini logic exactly
+      if (parsed.weight) {
+        if (/fix/i.test(parsed.weight)) {
+          parsed.weight = parsed.weight.trim();
+        } else {
+          // Try to parse a float out of the weight string
+          const numMatch = String(parsed.weight).trim().match(/-?\d+(\.\d+)?/);
+          if (numMatch) {
+            const weightNum = parseFloat(numMatch[0]);
+            if (!isNaN(weightNum)) {
+              if (weightNum > 0 && weightNum < 100) {
+                // multiply by 1000 and round (same as Gemini)
+                parsed.weight = Math.round(weightNum * 1000).toString();
+              } else {
+                parsed.weight = Math.round(weightNum).toString();
+              }
+            } else {
+              parsed.weight = parsed.weight.trim();
+            }
+          } else {
+            parsed.weight = parsed.weight.trim();
+          }
+        }
+      }
+
       console.log("[lrExtractor] Parsed result (from model) on attempt", i, parsed);
-      return parsed; // RETURN IMMEDIATELY — no more calls
+      return parsed;
     } else {
       console.warn(`[lrExtractor] Model returned unparsable/non-JSON on attempt ${i}. Raw:`, String(aiText).slice(0,1000));
-      // continue only if LR_RETRIES > 1
+      // continue if retries allowed
     }
   }
 
-  // After attempts exhausted, return empty fields (no local fallback per user's request)
   console.warn("[lrExtractor] Attempts exhausted — returning empty fields (no local fallback).");
   return { truckNumber: "", from: "", to: "", weight: "", description: "", name: "" };
 }
@@ -196,6 +315,7 @@ async function extractDetails(message) {
 async function isStructuredLR(message) {
   try {
     const d = await extractDetails(message);
+    if (!d) return false;
     return Boolean(d && d.truckNumber && d.to && d.weight && d.description);
   } catch (e) {
     console.error("[lrExtractor] isStructuredLR error:", e && e.message ? e.message : e);
