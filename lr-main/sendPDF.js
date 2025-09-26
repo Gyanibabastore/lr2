@@ -1,169 +1,250 @@
-// sendPDF.js
+// index.js
+require('dotenv').config();
+const express = require('express');
+const bodyParser = require('body-parser');
+const path = require('path');
 const fs = require('fs');
 const axios = require('axios');
-const FormData = require('form-data');
-const path = require('path');
+const XLSX = require('xlsx');
 
+const sendPDF = require('./sendPDF');
+const generatePDFWithTemplate = require('./templateManager'); // keep as-is in your project
+const logToExcel = require('./excelLogger'); // keep as-is in your project
+const sendExcel = require('./sendExcel'); // keep as-is
+const { extractDetails, isStructuredLR } = require('./utils/lrExtractor');
+const { normalizePhone } = require('./utils/phone');
+
+const app = express();
+app.use(bodyParser.json());
+app.use(express.static('templates'));
+
+const allowedNumbersPath = path.join(__dirname, './allowedNumbers.json');
 const subadminPath = path.join(__dirname, './subadmin.json');
+const GENERATED_LOGS = path.join(__dirname, 'generatedLogs.xlsx');
 
-// Normalize phone helper (same logic as app.js, self-contained)
-function normalizePhone(input, defaultCountry = "91") {
-  if (input === undefined || input === null || input === "") return null;
-  let s = String(input).trim();
-  s = s.replace(/\uFF0B/g, "+");
-  if (s.startsWith("+")) {
-    s = "+" + s.slice(1).replace(/\D/g, "");
-  } else {
-    s = s.replace(/\D/g, "");
+if (!fs.existsSync(allowedNumbersPath)) fs.writeFileSync(allowedNumbersPath, JSON.stringify([], null, 2));
+let allowedNumbers = JSON.parse(fs.readFileSync(allowedNumbersPath, 'utf8') || '[]');
+
+let subadminNumbers = [];
+try {
+  if (fs.existsSync(subadminPath)) {
+    subadminNumbers = JSON.parse(fs.readFileSync(subadminPath, 'utf8') || '[]');
+    if (!Array.isArray(subadminNumbers)) subadminNumbers = [];
   }
-  s = s.replace(/^\+?0+/, (m) => (m.startsWith("+") ? "+" : ""));
-  if (!s.startsWith("+")) {
-    if (s.length === 12 && s.startsWith(defaultCountry)) s = `+${s}`;
-    else if (s.length === 10) s = `+${defaultCountry}${s}`;
-    else s = `+${defaultCountry}${s}`;
-  }
-  if (!/^\+\d{6,15}$/.test(s)) return null;
-  return s;
+} catch (e) {
+  console.error('❌ reading subadmin.json', e.message);
 }
+const ADMIN_NUMBER_RAW = process.env.ADMIN_NUMBER || ''; // may be comma separated
+const ADMIN_NUMBERS = (ADMIN_NUMBER_RAW.split?.(',') || []).map(s => s.trim()).filter(Boolean);
 
-async function sendPDF(to, filePath, templateNumber = null, originalMessage = '', truckNumber = null) {
-  const adminNumberEnv = process.env.ADMIN_NUMBER || ""; // raw env (may be comma-separated)
-  let adminNumberFixed = null;
+let sentNumbers = [];
+let currentTemplate = 1;
+let awaitingTemplateSelection = false;
+let awaitingHelpSelection = false;
+let awaitingMonthSelection = false;
+const awaitingCancelSelection = {};
+setInterval(() => {
+  const now = Date.now();
+  Object.keys(awaitingCancelSelection).forEach(k => {
+    if (awaitingCancelSelection[k].expiresAt <= now) delete awaitingCancelSelection[k];
+  });
+}, 2 * 60 * 1000);
 
-  // read subadmins
-  let subadminNumbers = [];
+// helper to send simple text message (normalized)
+async function sendWhatsAppMessage(toRaw, text) {
   try {
-    if (fs.existsSync(subadminPath)) {
-      subadminNumbers = JSON.parse(fs.readFileSync(subadminPath, 'utf8'));
-      if (!Array.isArray(subadminNumbers)) {
-        console.error("❌ subadmin.json must be an array of numbers");
-        subadminNumbers = [];
-      }
+    const phoneId = process.env.PHONE_NUMBER_ID;
+    const token = process.env.WHATSAPP_TOKEN;
+    if (!phoneId || !token) throw new Error('WhatsApp env missing');
+
+    const to = normalizePhone(toRaw);
+    if (!to) {
+      console.error('❌ Invalid phone for sendWhatsAppMessage:', toRaw);
+      return;
     }
-  } catch (err) {
-    console.error("❌ Error reading subadmin.json:", err.message);
-    subadminNumbers = [];
-  }
 
-  try {
-    // Normalize recipient numbers
-    const userNumber = normalizePhone(to);
-    adminNumberFixed = normalizePhone(adminNumberEnv.split(',')[0] || "");
-    const subadminNumbersFixed = (subadminNumbers || []).map(n => normalizePhone(n)).filter(Boolean);
-
-    if (!userNumber) throw new Error("Invalid user phone number");
-
-    console.log("📤 Sending PDF to:", userNumber);
-
-    const fileName = `${truckNumber || 'LR'}.pdf`;
-    const tempDir = path.join(__dirname, 'temp');
-    const renamedPath = path.join(tempDir, fileName);
-
-    fs.mkdirSync(tempDir, { recursive: true });
-    fs.copyFileSync(filePath, renamedPath);
-
-    // Upload PDF to WhatsApp
-    console.log("🔁 Uploading media to WhatsApp...");
-    const form = new FormData();
-    form.append('file', fs.createReadStream(renamedPath));
-    form.append('type', 'application/pdf');
-    form.append('messaging_product', 'whatsapp');
-
-    const uploadRes = await axios.post(
-      `https://graph.facebook.com/v19.0/${process.env.PHONE_NUMBER_ID}/media`,
-      form,
-      {
-        headers: {
-          Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
-          ...form.getHeaders(),
-        },
-      }
-    );
-
-    const mediaId = uploadRes.data.id;
-    console.log("📎 Media uploaded. ID:", mediaId);
-
-    // Send to user
-    const userPayload = {
+    await axios.post(`https://graph.facebook.com/v19.0/${phoneId}/messages`, {
       messaging_product: "whatsapp",
-      to: userNumber,
-      type: "document",
-      document: {
-        id: mediaId,
-        caption: `\nDate: ${new Date().toLocaleDateString()}`,
-        filename: fileName,
-      },
-    };
-    console.log("➡️ Payload for user:", JSON.stringify(userPayload));
-    await axios.post(`https://graph.facebook.com/v19.0/${process.env.PHONE_NUMBER_ID}/messages`, userPayload, {
+      to,
+      text: { body: text },
+    }, {
       headers: {
-        Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
+        Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
       },
     });
-    console.log("✅ PDF sent to user:", userNumber);
-
-    // Send to admin + subadmins (normalize & dedupe)
-    const adminListRaw = [];
-    if (adminNumberFixed) adminListRaw.push(adminNumberFixed);
-    adminListRaw.push(...subadminNumbersFixed);
-
-    const uniqueAdmins = Array.from(new Set(adminListRaw.map(n => normalizePhone(n)).filter(Boolean)));
-
-    for (const number of uniqueAdmins) {
-      if (!number) continue;
-      const payload = {
-        messaging_product: "whatsapp",
-        to: number,
-        type: "document",
-        document: {
-          id: mediaId,
-          caption: `📄 LR\nT: ${templateNumber || '-'}\nMobile: ${userNumber}\nDate: ${new Date().toLocaleDateString()}\n\n📝 ${originalMessage}`,
-          filename: fileName,
-        },
-      };
-      console.log(`➡️ Payload for admin/subadmin ${number}:`, JSON.stringify(payload));
-      await axios.post(`https://graph.facebook.com/v19.0/${process.env.PHONE_NUMBER_ID}/messages`, payload, {
-        headers: {
-          Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
-          'Content-Type': 'application/json',
-        },
-      });
-      console.log(`✅ PDF sent to admin/subadmin: ${number}`);
-    }
-
-    // Cleanup
-    try { fs.unlinkSync(renamedPath); } catch(e){}
-    try { if (fs.existsSync(filePath)) { fs.unlinkSync(filePath); console.log("🗑 Deleted original generated PDF:", filePath); } } catch(e){}
-
   } catch (err) {
-    const errorMessage = err.response?.data?.error?.message || err.message;
-    console.error("❌ Error sending PDF:", errorMessage);
-
-    // Notify admin of failure (first admin only)
-    const adminNumber = normalizePhone((process.env.ADMIN_NUMBER || "").split(',')[0] || "");
-    if (adminNumber) {
-      const failMsg = `❌ *PDF failed to send*\nTo: ${to}\nReason: ${errorMessage}\n\n📝 ${originalMessage}`;
-      try {
-        await axios.post(
-          `https://graph.facebook.com/v19.0/${process.env.PHONE_NUMBER_ID}/messages`,
-          {
-            messaging_product: "whatsapp",
-            to: adminNumber,
-            text: { body: failMsg },
-          },
-          {
-            headers: {
-              Authorization: `Bearer ${process.env.WHATSAPP_TOKEN}`,
-              'Content-Type': 'application/json',
-            },
-          }
-        );
-      } catch (e) {
-        console.error("❌ Failed to notify admin about the failure:", e?.response?.data || e.message);
-      }
-    }
+    console.error('❌ sendWhatsAppMessage error', err?.response?.data || err.message);
   }
 }
 
-module.exports = sendPDF;
+// utility functions used by cancel flow (retain original logic)
+function getISTDate() {
+  const nowUTC = new Date();
+  return new Date(nowUTC.getTime() + (5.5 * 60 * 60 * 1000));
+}
+function parseINDateTime(dateStr, timeStr) {
+  try {
+    const [d, m, y] = String(dateStr).split('/').map(s => s.padStart(2, '0'));
+    if (!d || !m || !y) return null;
+    const [timePart, ampm] = String(timeStr).split(' ');
+    const [hh, mm] = (timePart || '00:00').split(':').map(s => s.padStart(2, '0'));
+    let hour = parseInt(hh, 10);
+    if (ampm && ampm.toUpperCase() === 'PM' && hour !== 12) hour += 12;
+    if (ampm && ampm.toUpperCase() === 'AM' && hour === 12) hour = 0;
+    return new Date(Date.UTC(
+      parseInt(y, 10),
+      parseInt(m, 10) - 1,
+      parseInt(d, 10),
+      hour - 5,
+      parseInt(mm, 10)
+    ));
+  } catch (e) {
+    return null;
+  }
+}
+function findRecentRowsForMobile(excelPath, mobile) {
+  if (!fs.existsSync(excelPath)) return [];
+  const workbook = XLSX.readFile(excelPath);
+  const results = [];
+  const now = getISTDate();
+  const targetMobile = String(mobile || '').replace(/\D/g, '');
+  workbook.SheetNames.forEach(sheetName => {
+    const sheet = workbook.Sheets[sheetName];
+    const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+    rows.forEach((row, idx) => {
+      const rowMobileRaw = row.Mobile || row['Mobile'] || row['Mobile No'] || row['Phone'] || '';
+      if (!rowMobileRaw) return;
+      const rowMobile = String(rowMobileRaw).replace(/\D/g, '');
+      if (rowMobile !== targetMobile) return;
+      const dt = parseINDateTime(String(row.Date || ''), String(row.Time || ''));
+      if (!dt) return;
+      const diff = now - dt;
+      if (diff >= 0 && diff <= 24 * 60 * 60 * 1000) {
+        results.push({ sheetName, rowIndex: idx, row, dt });
+      }
+    });
+  });
+  return results;
+}
+
+function markRowsCancelled(excelPath, mobile, targetRow) {
+  if (!fs.existsSync(excelPath)) return { updated: 0, message: 'No file' };
+  const workbook = XLSX.readFile(excelPath);
+  const now = new Date();
+  let updated = 0;
+  workbook.SheetNames.forEach(sheetName => {
+    const sheet = workbook.Sheets[sheetName];
+    const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+    const newRows = rows.map(r => {
+      try {
+        const rowMobile = String(r.Mobile || r['Mobile'] || '').trim();
+        if (rowMobile !== mobile) return r;
+        const dt = parseINDateTime(String(r.Date || ''), String(r.Time || ''));
+        if (!dt || now - dt > 24 * 60 * 60 * 1000) return r;
+        const targetTruck = String(targetRow.row['Truck No'] || '').trim();
+        const matchTruck = String(r['Truck No'] || '').trim() === targetTruck;
+        const matchWeight = String(r.Weight || '').trim() === String(targetRow.row.Weight || '').trim();
+        const matchTime = String(r.Time || '').trim() === String(targetRow.row.Time || '').trim();
+        if (matchTruck && matchWeight && matchTime) {
+          r.Cancelled = 'Yes';
+          if (r.Status) {
+            if (!String(r.Status).toLowerCase().includes('cancel')) {
+              r.Status = `${r.Status} (Cancelled)`;
+            }
+          } else {
+            r.Status = 'Cancelled';
+          }
+          updated++;
+        }
+      } catch (e) {}
+      return r;
+    });
+    if (updated > 0) {
+      const newSheet = XLSX.utils.json_to_sheet(newRows);
+      workbook.Sheets[sheetName] = newSheet;
+    }
+  });
+  if (updated > 0) XLSX.writeFile(workbook, excelPath);
+  return { updated };
+}
+
+/* ------------------- Webhook endpoints ------------------- */
+app.get('/webhook', (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+  if (mode === 'subscribe' && token === process.env.VERIFY_TOKEN) {
+    return res.status(200).send(challenge);
+  } else {
+    return res.sendStatus(403);
+  }
+});
+
+app.post('/webhook', async (req, res) => {
+  try {
+    const entry = req.body?.entry?.[0];
+    const changes = entry?.changes?.[0]?.value;
+    const messages = changes?.messages?.[0];
+    if (!messages) return res.sendStatus(200);
+
+    const from = messages.from;
+    const message = messages.text?.body?.trim();
+    const adminNumbers = ADMIN_NUMBERS;
+
+    if (!allowedNumbers.includes(from) && !adminNumbers.includes(from)) {
+      console.log(`⛔ Blocked message from unauthorized number: ${from}`);
+      return res.sendStatus(200);
+    }
+
+    if (typeof message !== 'string') {
+      console.error('❌ Invalid message:', message);
+      return res.status(400).send('Message is required');
+    }
+
+    const cleanedMessage = message.toLowerCase();
+    console.log('👤 From:', from);
+    console.log('💬 Message:', message);
+
+    // Admin flows (kept simple — you can re-add original menu logic)
+    if (adminNumbers.includes(from)) {
+      if (['change template', 'home'].includes(cleanedMessage)) {
+        awaitingTemplateSelection = true;
+        const textBody = `📂 *Choose your PDF Template:*\n\n1️⃣ Template 1\n2️⃣ Template 2\n3️⃣ Template 3\n4️⃣ Template 4\n5️⃣ Template 5\n6️⃣ Template 6\n7️⃣ Template 7\n8️⃣ Template 8\n\n🟢 Reply with a number (1–8) to select.`;
+        await sendWhatsAppMessage(from, textBody);
+        return res.sendStatus(200);
+      }
+      if (awaitingTemplateSelection && /^[1-8]$/.test(cleanedMessage)) {
+        currentTemplate = parseInt(cleanedMessage);
+        awaitingTemplateSelection = false;
+        await sendWhatsAppMessage(from, `✅ Template ${currentTemplate} selected.`);
+        return res.sendStatus(200);
+      }
+      // admin help/menu handlers etc can be reinserted here if needed
+    }
+
+    /* ---------------- Existing goods handling ---------------- */
+    const goodsKeywords = [
+      'aluminium','tmt bar','scrap','plastic','battery','paper','finish','steel','plates','coil','drum',
+      // (trimmed list) — keep list you had originally
+    ];
+
+    if (goodsKeywords.some(good => cleanedMessage.includes(good))) {
+      if (!allowedNumbers.includes(from)) {
+        console.log('🚫 Number not allowed:', from);
+        return res.sendStatus(200);
+      }
+
+      if (!(await isStructuredLR(cleanedMessage))) {
+        console.log('⚠ Ignored message (not LR structured):', message);
+        if (ADMIN_NUMBERS.length > 0) {
+          await sendWhatsAppMessage(ADMIN_NUMBERS[0], `⚠ Ignored unstructured LR from ${from}\n\nMessage: ${message}`);
+        }
+        return res.sendStatus(200);
+      }
+
+      const extracted = await extractDetails(cleanedMessage);
+      const timeNow = new Date().toLocaleTimeString('en-IN', {
+        timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: true
+      });
+      const dateNow = new Date().toLocaleDateString('en-IN', { t
