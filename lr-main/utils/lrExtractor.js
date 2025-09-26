@@ -1,10 +1,11 @@
 // utils/lrExtractor.js
-// AI-first LR extractor with fallback (ready-to-paste).
+// Improved AI-first LR extractor with robust strict-prompting, weight heuristics,
+// detailed console logging, and deterministic fallback.
 // Exports: extractDetails(message) and isStructuredLR(message)
 
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 
-// --- Inline API key as requested ---
+// --- Inline API key (kept as provided) ---
 const API_KEY = "AIzaSyBTt-wdj0YsByntwscggZ0dDRzrc7Qmc7I";
 const MODEL_NAME = "models/gemini-2.0-flash";
 
@@ -48,7 +49,7 @@ const parseNumberLike = (t) => {
   return m ? m[1] : "";
 };
 
-// Try to extract JSON object from messy AI text (forgiving)
+// Extract JSON object from AI text (forgiving)
 function tryParseJsonFromText(text) {
   if (!text) return null;
   const txt = String(text).trim();
@@ -70,7 +71,89 @@ function tryParseJsonFromText(text) {
   }
 }
 
-// Deterministic fallback parser (uses goodsKeywords)
+// ----------------- Weight tokenization + heuristics -----------------
+// get numeric tokens with small context window
+function numericTokensWithContext(text) {
+  const tokens = [];
+  if (!text) return tokens;
+  const words = text.split(/\s+/);
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i];
+    const m = w.match(/([0-9]{1,7}(?:[.,][0-9]+)?)/);
+    if (m) {
+      const num = parseNumberLike(m[1]);
+      const ctx = words.slice(Math.max(0, i - 3), Math.min(words.length, i + 4)).join(" ");
+      tokens.push({ raw: w, num, index: i, context: ctx });
+    }
+  }
+  return tokens;
+}
+
+// detect if numeric token likely part of truck plate nearby
+function looksLikeTruckNumberToken(tokenRaw, fullMessage) {
+  if (!tokenRaw) return false;
+  const joined = fullMessage.replace(/\s+/g, "");
+  // naive check: presence of common plate pattern in message
+  if (joined.match(/[A-Za-z]{2}\d{1,2}[A-Za-z]{1,3}\d{1,4}/)) {
+    // if this token appears immediately after letters in original message, consider truck
+    if (new RegExp(`[A-Za-z]{2}\\s?\\d{1,2}\\s?[A-Za-z]{1,3}\\s?${tokenRaw}`, "i").test(fullMessage)) {
+      return true;
+    }
+  }
+  // else conservatively return false
+  return false;
+}
+
+// pick best weight candidate using heuristics
+function pickBestWeightCandidate(message) {
+  const weightWords = ["wt","weight","kg","kgs","kilogram","kilograms","ton","tons","t","mt","quintal"];
+  const tokens = numericTokensWithContext(message);
+  if (!tokens.length) return "";
+
+  // prefer tokens near weight words
+  const nearWeight = tokens.filter(t => {
+    const ctx = t.context.toLowerCase();
+    for (const w of weightWords) if (ctx.includes(w)) return true;
+    return false;
+  }).filter(t => !looksLikeTruckNumberToken(t.raw, message));
+
+  if (nearWeight.length) {
+    nearWeight.sort((a,b) => {
+      const aHasUnit = /kg|kgs|ton|mt|wt|quintal/.test(a.context.toLowerCase()) ? 1 : 0;
+      const bHasUnit = /kg|kgs|ton|mt|wt|quintal/.test(b.context.toLowerCase()) ? 1 : 0;
+      return (bHasUnit - aHasUnit) || (parseFloat(b.num) - parseFloat(a.num));
+    });
+    return nearWeight[0].num;
+  }
+
+  // tokens that include unit suffix
+  const withUnit = tokens.filter(t => /kg|kgs|mt|ton|t\b/.test(t.raw.toLowerCase()))
+    .filter(t => !looksLikeTruckNumberToken(t.raw, message));
+  if (withUnit.length) {
+    withUnit.sort((a,b) => parseFloat(b.num) - parseFloat(a.num));
+    return withUnit[0].num;
+  }
+
+  // tokens > 1000 and not truck-like
+  const large = tokens.filter(t => parseFloat(t.num || 0) >= 1000 && !looksLikeTruckNumberToken(t.raw, message));
+  if (large.length) {
+    large.sort((a,b) => parseFloat(b.num) - parseFloat(a.num));
+    return large[0].num;
+  }
+
+  // fallback: largest non-truck token
+  const nonTruck = tokens.filter(t => !looksLikeTruckNumberToken(t.raw, message));
+  if (nonTruck.length) {
+    nonTruck.sort((a,b) => parseFloat(b.num) - parseFloat(a.num));
+    return nonTruck[0].num;
+  }
+
+  // last resort: largest token
+  tokens.sort((a,b) => parseFloat(b.num) - parseFloat(a.num));
+  return tokens[0].num;
+}
+
+// ----------------- Deterministic fallback parser -----------------
 function fallbackParse(message) {
   const lines = String(message || "")
     .split(/\r?\n/)
@@ -110,17 +193,12 @@ function fallbackParse(message) {
       break;
     }
   }
-  // 3) weight detection
+
+  // 3) weight detection using heuristics
   if (!weight) {
-    for (const ln of lines) {
-      const pure = ln.replace(/[,\s]/g, "");
-      if (/^\d{2,7}$/.test(pure) || /^\d+(\.\d+)?\s*(kg|kgs|ton|t|mt)?$/i.test(ln)) {
-        weight = parseNumberLike(ln);
-        break;
-      }
-      const m = ln.match(/([0-9]{2,7}(?:[.,][0-9]+)?)/);
-      if (m) { weight = parseNumberLike(m[1]); break; }
-    }
+    const joined = lines.join(" ");
+    const candidate = pickBestWeightCandidate(joined);
+    if (candidate) weight = parseNumberLike(candidate);
   }
 
   // 4) description detection: prefer goodsKeywords match
@@ -138,7 +216,7 @@ function fallbackParse(message) {
     for (const ln of lines) {
       if (/^\d+$/.test(ln.replace(/\s/g, ""))) continue;
       if (ln.toLowerCase().includes('to') && ln.split(/\s+/).length > 2) continue;
-      if (ln.length > 1 && ln.length < 120) { description = capitalize(ln); break; }
+      if (ln.length > 1 && ln.length < 160) { description = capitalize(ln); break; }
     }
   }
 
@@ -167,7 +245,7 @@ function fallbackParse(message) {
   };
 }
 
-// low-level AI call (returns text)
+// ----------------- Low-level AI call (returns text) -----------------
 async function aiCall(prompt) {
   try {
     const model = genAI.getGenerativeModel ? genAI.getGenerativeModel({ model: MODEL_NAME }) : null;
@@ -181,73 +259,58 @@ async function aiCall(prompt) {
     }
     return "";
   } catch (e) {
+    console.error("[lrExtractor] aiCall error:", e && e.message ? e.message : e);
     return "";
   }
 }
 
-// ----------------- Public API -----------------
-async function extractDetails(message) {
-  if (!message) return { truckNumber: "", from: "", to: "", weight: "", description: "", name: "" };
+// ----------------- Prompt builder (strict) -----------------
+function buildStrictPrompt(message) {
+  return `
+You are a reliable logistics parser. Extract exactly ONE JSON object and NOTHING ELSE with these keys:
+"truckNumber","from","to","weight","description","name"
 
-  const primaryPrompt = `
-You are a smart logistics parser.
-
-Extract the following mandatory details from this message:
-
-- truckNumber (which may be 9 or 10 characters long, possibly containing spaces or hyphens) 
-  Example: "MH 09 HH 4512" should be returned as "MH09HH4512"
-- to
-- weight
-- description
-
-Also, extract the optional fields:
-- from (this is optional but often present)
-- name (if the message contains a pattern like "n - name", "n-name", " n name", " n. name", or any variation where 'n' is followed by '-' or '.' or space, and then the person's name — extract the text after it as the name value)
-
-If truckNumber is missing, but the message contains words like "brllgada","bellgade","bellgad","bellgadi","new truck", "new tractor", or "new gadi", 
-then set truckNumber to that phrase (exactly as it appears).
-
-If the weight contains the word "fix" or similar, preserve it as-is.
-
-Here is the message:
-"""${String(message).replace(/```/g, "")}"""
-
-Return the extracted information strictly in the following JSON format and NOTHING ELSE (no explanations, no code fences):
-
-{
-  "truckNumber": "",
-  "from": "",
-  "to": "",
-  "weight": "",
-  "description": "",
-  "name": ""
-}
-
-If any field is missing, return it as an empty string.
-`;
-
-  const strictPrompt = `
-STRICT: Reply ONLY with a single JSON object and NOTHING ELSE.
-Keys: "truckNumber","from","to","weight","description","name"
-If missing, set to "".
+Rules:
+- truckNumber: return Indian plate normalized (no spaces/dashes, uppercase) if present (e.g., "MH09HH4512"). If missing but message contains phrases like "new truck","new gadi","bellgadi", return that phrase as truckNumber.
+- weight: prefer numbers closest to tokens: wt, weight, kg, kgs, mt, ton. If value <100 treat as tons and multiply by 1000. If it contains "fix" or non-numeric preserve as-is.
+- description: short human-readable goods line (capitalize each word).
+- If any field not found, set it to empty string "".
+- Reply with JSON only (no markdown, no explanation).
 
 Message:
-"""${String(message).replace(/```/g, "")}"""
+"""${String(message).replace(/```/g,"")}"""
 `;
+}
 
-  // try AI attempts first (primary -> strict -> short strict)
-  const prompts = [primaryPrompt, strictPrompt, `JSON ONLY:\n${strictPrompt}`];
-  let aiParsed = null;
-  for (let i = 0; i < prompts.length; i++) {
-    const aiText = await aiCall(prompts[i]);
-    if (!aiText) continue;
+// ----------------- Public API -----------------
+async function extractDetails(message) {
+  const startTs = Date.now();
+  console.log("[lrExtractor] extractDetails called. Message snippet:", String(message || "").slice(0,300).replace(/\n/g, ' | '));
+  if (!message) {
+    console.log("[lrExtractor] Empty message -> returning empty object.");
+    return { truckNumber: "", from: "", to: "", weight: "", description: "", name: "" };
+  }
 
-    // debug help for you: log short snippet so you can paste full raw if needed
-    try { console.log(`[lrExtractor] AI raw (snippet): ${String(aiText).slice(0,800)}`); } catch (e) {}
+  const promptBase = buildStrictPrompt(message);
 
+  // try AI up to 3 attempts with small nudges
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const attemptNote = attempt === 0 ? "" : attempt === 1 ? "\nNOTE: Return JSON only, ensure keys exist." : "\nFINAL: If unsure, leave empty.";
+    const prompt = promptBase + attemptNote;
+    console.log(`[lrExtractor] AI attempt ${attempt+1} - sending prompt (first 200 chars):`, prompt.slice(0,200).replace(/\n/g,' '));
+    const aiText = await aiCall(prompt);
+    if (!aiText) {
+      console.log(`[lrExtractor] AI attempt ${attempt+1} returned empty response.`);
+      continue;
+    }
+    console.log(`[lrExtractor] AI raw response (snippet 0..800): ${String(aiText).slice(0,800)}`);
+
+    // try to parse JSON out of aiText
     const parsed = tryParseJsonFromText(aiText);
     if (parsed && typeof parsed === "object") {
-      aiParsed = {
+      console.log(`[lrExtractor] AI parsed JSON (raw):`, parsed);
+      // sanitize and normalize fields
+      const out = {
         truckNumber: parsed.truckNumber ? String(parsed.truckNumber).trim() : "",
         from: parsed.from ? String(parsed.from).trim() : "",
         to: parsed.to ? String(parsed.to).trim() : "",
@@ -255,56 +318,67 @@ Message:
         description: parsed.description ? String(parsed.description).trim() : "",
         name: parsed.name ? String(parsed.name).trim() : ""
       };
-      break;
+
+      // Normalize truck unless it's one of the special phrases
+      const specials = ["new truck","new tractor","new gadi","bellgadi","bellgada","bellgade","bellgad","brllgada"];
+      if (out.truckNumber && !specials.includes(out.truckNumber.toLowerCase())) {
+        out.truckNumber = normalizeTruck(out.truckNumber);
+      }
+
+      // Capitalize human fields
+      if (out.from) out.from = capitalize(out.from);
+      if (out.to) out.to = capitalize(out.to);
+      if (out.description) out.description = capitalize(out.description);
+      if (out.name) out.name = capitalize(out.name);
+
+      // Weight normalization (preserve 'fix')
+      if (out.weight && !/fix/i.test(out.weight)) {
+        const wn = String(out.weight).replace(/,/g,"");
+        const n = parseFloat(wn);
+        if (!isNaN(n)) {
+          if (n > 0 && n < 100) out.weight = Math.round(n * 1000).toString();
+          else out.weight = Math.round(n).toString();
+        } else {
+          out.weight = out.weight;
+        }
+      }
+
+      const took = Date.now() - startTs;
+      console.log("[lrExtractor] Final parsed (from AI). Took(ms):", took, "Result:", out);
+      return out;
+    } else {
+      console.log(`[lrExtractor] AI attempt ${attempt+1} didn't return parseable JSON. Raw returned but parse failed.`);
     }
   }
 
-  // fallback parse if AI missing fields or no AI result
-  if (aiParsed) {
-    const missing = !aiParsed.truckNumber || !aiParsed.to || !aiParsed.weight || !aiParsed.description;
-    if (missing) {
-      const fb = fallbackParse(message);
-      aiParsed.truckNumber = aiParsed.truckNumber || fb.truckNumber || "";
-      aiParsed.from = aiParsed.from || fb.from || "";
-      aiParsed.to = aiParsed.to || fb.to || "";
-      aiParsed.weight = aiParsed.weight || fb.weight || "";
-      aiParsed.description = aiParsed.description || fb.description || "";
-      aiParsed.name = aiParsed.name || fb.name || "";
-    }
+  // if AI failed all attempts -> use fallback
+  console.warn("[lrExtractor] AI failed to produce valid JSON after 3 attempts — running deterministic fallback.");
+  const fb = fallbackParse(message);
+
+  // Normalize truck unless special
+  if (fb.truckNumber && !["new truck","new tractor","new gadi","bellgadi","bellgada","bellgade","bellgad","brllgada"].includes(fb.truckNumber.toLowerCase())) {
+    fb.truckNumber = normalizeTruck(fb.truckNumber);
   }
-
-  const final = aiParsed || fallbackParse(message);
-
-  // Normalize truck unless it's a special phrase
-  if (final.truckNumber && !["new truck","new tractor","new gadi","bellgadi","bellgada","bellgade","bellgad","brllgada"].includes(final.truckNumber.toLowerCase())) {
-    final.truckNumber = normalizeTruck(final.truckNumber);
-  }
-
-  // Capitalize fields
-  if (final.from) final.from = capitalize(final.from);
-  if (final.to) final.to = capitalize(final.to);
-  if (final.description) final.description = capitalize(final.description);
-  if (final.name) final.name = capitalize(final.name);
+  if (fb.from) fb.from = capitalize(fb.from);
+  if (fb.to) fb.to = capitalize(fb.to);
+  if (fb.description) fb.description = capitalize(fb.description);
+  if (fb.name) fb.name = capitalize(fb.name);
 
   // Weight normalization (preserve 'fix')
-  if (final.weight && !/fix/i.test(final.weight)) {
-    const n = parseFloat(String(final.weight).replace(/,/g, ''));
-    if (!isNaN(n)) {
-      if (n > 0 && n < 100) final.weight = Math.round(n * 1000).toString();
-      else final.weight = Math.round(n).toString();
+  if (fb.weight && !/fix/i.test(fb.weight)) {
+    const wn2 = String(fb.weight).replace(/,/g,"");
+    const n2 = parseFloat(wn2);
+    if (!isNaN(n2)) {
+      if (n2 > 0 && n2 < 100) fb.weight = Math.round(n2 * 1000).toString();
+      else fb.weight = Math.round(n2).toString();
     } else {
-      final.weight = String(final.weight).trim();
+      fb.weight = fb.weight;
     }
   }
 
-  return {
-    truckNumber: final.truckNumber || "",
-    from: final.from || "",
-    to: final.to || "",
-    weight: final.weight || "",
-    description: final.description || "",
-    name: final.name || ""
-  };
+  const took2 = Date.now() - startTs;
+  console.log("[lrExtractor] Final parsed (from fallback). Took(ms):", took2, "Result:", fb);
+  return fb;
 }
 
 async function isStructuredLR(message) {
@@ -312,6 +386,7 @@ async function isStructuredLR(message) {
     const d = await extractDetails(message);
     return Boolean(d.truckNumber && d.to && d.weight && d.description);
   } catch (e) {
+    console.error("[lrExtractor] isStructuredLR error:", e && e.message ? e.message : e);
     return false;
   }
 }
