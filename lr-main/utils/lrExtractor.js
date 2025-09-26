@@ -1,14 +1,15 @@
+// lrExtractor.js — OpenAI (gpt-5-nano) based LR extractor with verbose console logging
+// Uses process.env.key only (NO dotenv, NO hardcoded API key).
 
-const API_KEY = "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";
-
+const API_KEY = process.env.GEMINI_API_KEY; // env var name: "key"
 const SELECTED_MODEL = "gpt-5-nano";
 let rateLimitResetTs = 0;
 
 // For reproducible empty return
 const EMPTY_OUT = { truckNumber: "", from: "", to: "", weight: "", description: "", name: "" };
 
-if (!API_KEY || API_KEY === "sk-REPLACE_WITH_OPENAI_KEY") {
-  console.warn("[lrExtractor] WARNING: OPENAI API key not set (or left placeholder). Paste your key into API_KEY to enable AI calls.");
+if (!API_KEY) {
+  console.warn("[lrExtractor] process.env.key is not set. AI calls will be skipped until this env var is provided.");
 }
 
 // ----------------- Helpers -----------------
@@ -81,8 +82,8 @@ async function aiCallWithRateLimit(prompt) {
     return "";
   }
 
-  if (!API_KEY || API_KEY === "sk-REPLACE_WITH_OPENAI_KEY") {
-    console.warn("[lrExtractor] No valid OPENAI API key present — skipping AI call.");
+  if (!API_KEY) {
+    console.warn("[lrExtractor] No OPENAI API key (process.env.key) — skipping AI call.");
     return "";
   }
 
