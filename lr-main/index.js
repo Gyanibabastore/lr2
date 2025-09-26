@@ -51,7 +51,7 @@ try {
 }
 
 let sentNumbers = [];
-let currentTemplate = 1;
+let currentTemplate = 4;
 let awaitingTemplateSelection = false;
 let awaitingHelpSelection = false;
 let awaitingMonthSelection = false;
