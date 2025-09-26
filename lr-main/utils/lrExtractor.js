@@ -1,5 +1,5 @@
 
-const API_KEY = "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";
+const API_KEY = "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";
 
 const SELECTED_MODEL = "gpt-5-nano";
 let rateLimitResetTs = 0;
