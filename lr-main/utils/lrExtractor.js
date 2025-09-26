@@ -1,15 +1,45 @@
-
+// utils/lrExtractor.js
+// ChatGPT (gpt-5-mini) single-call LR extractor.
+// Exports: extractDetails(message) and isStructuredLR(message)
+//
+// NOTE: prompt left exactly as you provided (no changes).
 
 'use strict';
 
+// load .env if present (harmless if already loaded elsewhere)
+try { require('dotenv').config(); } catch (e) { /* ignore */ }
+
 const OpenAI = require('openai');
 
-// Use GEMINI_API_KEY per your environment
-const API_KEY = process.env.GEMINI_API_KEY || '';
+// --- sanitize & load key from GEMINI_API_KEY (per your env) ---
+function cleanKey(k) {
+  if (!k) return '';
+  return String(k).trim().replace(/^["'=]+|["']+$/g, ''); // strip wrapping quotes/equals
+}
+function maskKey(k) {
+  if (!k) return '<missing>';
+  const s = String(k);
+  if (s.length <= 12) return s;
+  return s.slice(0, 6) + '...' + s.slice(-4);
+}
+
+const RAW_KEY = process.env.GEMINI_API_KEY || '';
+const API_KEY = cleanKey(RAW_KEY);
+
 if (!API_KEY) {
   console.warn("[lrExtractor] WARNING: No API key found. Set process.env.GEMINI_API_KEY.");
+} else {
+  console.log("[lrExtractor] GEMINI_API_KEY preview:", maskKey(API_KEY));
 }
-const openai = new OpenAI({ apiKey: API_KEY });
+
+let openai = null;
+if (API_KEY) {
+  try {
+    openai = new OpenAI({ apiKey: API_KEY });
+  } catch (e) {
+    console.warn("[lrExtractor] Failed to create OpenAI client:", e && e.message ? e.message : e);
+  }
+}
 
 // Model to use (single-call)
 const MODEL_NAME = "gpt-5-mini";
@@ -96,8 +126,8 @@ Message:
 
 // ----------------- Single AI call -----------------
 async function singleAiCall(prompt) {
-  if (!API_KEY) {
-    console.warn("[lrExtractor] No API key: skipping AI call.");
+  if (!API_KEY || !openai) {
+    console.warn("[lrExtractor] No API key/client available: skipping AI call.");
     return "";
   }
 
