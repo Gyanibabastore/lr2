@@ -538,44 +538,130 @@ app.post('/webhook', async (req, res) => {
       'finishu','finisih','finis','finnish','finsh','finush','fnish','funish','plates','plate','iron','iran',
     ];
 
-    if (goodsKeywords.some(good => cleanedMessage.includes(good))) {
-      if (!allowedNumbers.includes(from)) {
-        console.log("🚫 Number not allowed:", from);
-        return res.sendStatus(200);
-      }
+   /* ---------------- Existing goods handling (UPDATED) ---------------- */
+if (goodsKeywords.some(good => cleanedMessage.includes(good))) {
+  if (!allowedNumbers.includes(from)) {
+    console.log("🚫 Number not allowed:", from);
+    return res.sendStatus(200);
+  }
 
-      // Keep original structured check, but defensive: try to extract and if AI fails do not ignore outright
-      const extractedForCheck = await extractDetails(cleanedMessage);
-      if (!(extractedForCheck.truckNumber && extractedForCheck.to && extractedForCheck.weight && extractedForCheck.description)) {
-        // Log and continue to attempt processing (don't return). This prevents ignoring valid messages due to parser failure.
-        console.log("⚠ Parser incomplete for message, proceeding with best-effort extraction:", message);
-      }
+  // 1) Extract details once and use to decide further steps
+  const extracted = await extractDetails(cleanedMessage);
+  console.log("[webhook] Extracted LR fields for processing:", extracted);
 
-      const extracted = await extractDetails(cleanedMessage);
-      const timeNow = new Date().toLocaleTimeString('en-IN', {
-        timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: true
-      });
-      const dateNow = new Date().toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' });
+  const hasMandatory =
+    extracted &&
+    typeof extracted === 'object' &&
+    extracted.truckNumber &&
+    extracted.to &&
+    extracted.weight &&
+    extracted.description;
 
-      const lrData = { ...extracted, time: timeNow, date: dateNow };
+  // If mandatory fields are missing -> notify admin/subadmins and DO NOT generate PDF or log to Excel
+  if (!hasMandatory) {
+    console.warn("[webhook] Mandatory LR fields missing — skipping PDF & Excel. Notifying admin/subadmins...");
 
+    const notifLines = [
+      '⚠️ LR Parser Incomplete — PDF NOT SENT',
+      `Mobile: ${from}`,
+      `Template: ${currentTemplate || '-'}`,
+      `Original message:`,
+      `${message || '-'}`,
+      '',
+      'Parsed fields (best-effort):',
+      `truckNumber: ${extracted?.truckNumber || ''}`,
+      `from: ${extracted?.from || ''}`,
+      `to: ${extracted?.to || ''}`,
+      `weight: ${extracted?.weight || ''}`,
+      `description: ${extracted?.description || ''}`,
+      `name: ${extracted?.name || ''}`,
+      '',
+      'Action: Please review the message and send PDF manually once details are available.'
+    ];
+
+    const adminText = notifLines.join('\n');
+
+    // notify primary admin
+    const adminNumberRaw = process.env.ADMIN_NUMBER;
+    const adminNumber = adminNumberRaw ? adminNumberRaw.split?.(',')[0] || adminNumberRaw : null;
+    if (adminNumber) {
+      try { await sendWhatsAppMessage(adminNumber, adminText); } catch (e) { console.error('[webhook] Failed to notify admin', e?.message || e); }
+    } else {
+      console.warn('[webhook] ADMIN_NUMBER not configured — skipping admin notify.');
+    }
+
+    // notify subadmins
+    for (const sa of subadminNumbers || []) {
+      try { await sendWhatsAppMessage(sa, adminText); } catch (e) { console.error('[webhook] Failed to notify subadmin', sa, e?.message || e); }
+    }
+
+    // Do NOT generate PDF or log to Excel
+    return res.sendStatus(200);
+  }
+
+  // 2) Mandatory fields are present -> generate PDF, send and then log to Excel only if send was successful
+  const timeNow = new Date().toLocaleTimeString('en-IN', {
+    timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: true
+  });
+  const dateNow = new Date().toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' });
+
+  const lrData = { ...extracted, time: timeNow, date: dateNow };
+
+  try {
+    // generate PDF
+    const pdfPath = await generatePDFWithTemplate(currentTemplate, lrData, message);
+
+    // sendPDF returns object { sent: true, mediaId, fileName } or { sent: false, reason, details } or throws
+    const sendResult = await sendPDF(from, pdfPath, currentTemplate, message, lrData.truckNumber);
+
+    if (sendResult && sendResult.sent) {
+      // Only log to excel when PDF actually sent successfully
       try {
-        const pdfPath = await generatePDFWithTemplate(currentTemplate, lrData, message);
-        await sendPDF(from, pdfPath, currentTemplate, message, lrData.truckNumber);
         logToExcel({
           Date: dateNow, Time: timeNow, 'Truck No': lrData.truckNumber,
           From: lrData.from, To: lrData.to, Weight: lrData.weight,
           Description: lrData.description, name: lrData.name,
           Template: currentTemplate, Mobile: from
         });
-      } catch (err) {
-        console.error("❌ PDF Error:", err.message || err);
-        if (ADMIN_NUMBERS && ADMIN_NUMBERS.length > 0) {
-          await sendWhatsAppMessage(ADMIN_NUMBERS.split?.(',')[0] || ADMIN_NUMBERS, `❌ Failed to generate/send PDF for ${from}`);
-        }
+      } catch (logErr) {
+        console.error('[webhook] Failed to log to Excel after successful send:', logErr?.message || logErr);
       }
-      if (!sentNumbers.includes(from)) sentNumbers.push(from);
+    } else {
+      // sendPDF returned sent:false — notify admin with details and DO NOT log to excel
+      const adminText = [
+        '⚠️ PDF NOT SENT (sendPDF returned failure)',
+        `Mobile: ${from}`,
+        `Template: ${currentTemplate || '-'}`,
+        `Original message: ${message || '-'}`,
+        '',
+        `sendPDF result: ${JSON.stringify(sendResult || {})}`
+      ].join('\n');
+
+      const adminNumberRaw = process.env.ADMIN_NUMBER;
+      const adminNumber = adminNumberRaw ? adminNumberRaw.split?.(',')[0] || adminNumberRaw : null;
+      if (adminNumber) {
+        try { await sendWhatsAppMessage(adminNumber, adminText); } catch (e) { console.error('[webhook] Failed to notify admin about sendPDF failure', e?.message || e); }
+      }
+      for (const sa of subadminNumbers || []) {
+        try { await sendWhatsAppMessage(sa, adminText); } catch (e) { console.error('[webhook] Failed to notify subadmin about sendPDF failure', sa, e?.message || e); }
+      }
     }
+  } catch (err) {
+    // generation or sending threw an error -> notify admin, DO NOT log to excel
+    console.error("❌ PDF generation/send Error:", err.message || err);
+    const errText = `❌ Failed to generate/send PDF for ${from}\nError: ${err?.message || err}\nOriginal message:\n${message || '-'}`;
+    const adminNumberRaw = process.env.ADMIN_NUMBER;
+    const adminNumber = adminNumberRaw ? adminNumberRaw.split?.(',')[0] || adminNumberRaw : null;
+    if (adminNumber) {
+      try { await sendWhatsAppMessage(adminNumber, errText); } catch (e) { console.error('[webhook] Failed to notify admin about exception', e?.message || e); }
+    }
+    for (const sa of subadminNumbers || []) {
+      try { await sendWhatsAppMessage(sa, errText); } catch (e) { console.error('[webhook] Failed to notify subadmin about exception', sa, e?.message || e); }
+    }
+  }
+
+  if (!sentNumbers.includes(from)) sentNumbers.push(from);
+} // end goodsKeywords check
 
     return res.sendStatus(200);
   } catch (err) {
