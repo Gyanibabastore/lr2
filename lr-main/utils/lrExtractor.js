@@ -3,7 +3,7 @@ dotenv.config();
 
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 
-// Create Gemini client
+// 🔑 Directly using your API key (not from process.env)
 const genAI = new GoogleGenerativeAI("AIzaSyBTt-wdj0YsByntwscggZ0dDRzrc7Qmc7I");
 
 async function extractDetails(message) {
@@ -12,7 +12,7 @@ async function extractDetails(message) {
   const prompt = `
 You are a smart logistics parser.
 
-Extract the following **mandatory** details from this message:
+Extract the following *mandatory* details from this message:
 
 - truckNumber (which may be 9 or 10 characters long, possibly containing spaces or hyphens) 
   Example: "MH 09 HH 4512" should be returned as "MH09HH4512"
@@ -20,7 +20,7 @@ Extract the following **mandatory** details from this message:
 - weight
 - description
 
-Also, extract the **optional** fields:
+Also, extract the *optional* fields:
 - from (this is optional but often present)
 - name (if the message contains a pattern like "n - name", "n-name", " n name", " n. name", or any variation where 'n' is followed by '-' or '.' or space, and then the person's name — extract the text after it as the name value)
 
@@ -51,18 +51,22 @@ Ensure the output is only the raw JSON — no extra text, notes, or formatting o
   try {
     console.log("⏳ Sending prompt to Gemini...");
 
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-pro-latest" });
+    const model = genAI.getGenerativeModel({
+      model: "models/gemini-2.0-flash",  // ✅ Using Gemini 2.0 Flash
+    });
 
     const result = await model.generateContent(prompt);
-    const response = await result.response;
-    let resultText = response.text();
+
+    // ✅ Safely extract text from Gemini response
+    let resultText =
+      result?.response?.candidates?.[0]?.content?.parts?.[0]?.text || "";
 
     console.log("📤 Raw Response from Gemini:\n", resultText);
 
     // 🧼 Remove Markdown/code block formatting
     resultText = resultText.trim();
-    if (resultText.startsWith("```")) {
-      resultText = resultText.replace(/```(?:json)?/g, "").trim();
+    if (resultText.startsWith("")) {
+      resultText = resultText.replace(/(?:json)?/g, "").trim();
     }
 
     let extracted = {};
