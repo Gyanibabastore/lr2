@@ -1,10 +1,9 @@
 // utils/lrExtractor.js
-// ChatGPT (gpt-5-mini) single-call LR extractor (patched).
+// ChatGPT (gpt-5-mini) single-call LR extractor (patched to remove temperature=0).
 // Exports: extractDetails(message) and isStructuredLR(message)
 
 'use strict';
 
-// load .env if present (harmless if already loaded elsewhere)
 try { require('dotenv').config(); } catch (e) { /* ignore */ }
 
 const OpenAI = require('openai');
@@ -12,7 +11,7 @@ const OpenAI = require('openai');
 // --- sanitize & load key from GEMINI_API_KEY (per your env) ---
 function cleanKey(k) {
   if (!k) return '';
-  return String(k).trim().replace(/^["'=]+|["']+$/g, ''); // strip wrapping quotes/equals
+  return String(k).trim().replace(/^["'=]+|["']+$/g, '');
 }
 function maskKey(k) {
   if (!k) return '<missing>';
@@ -39,24 +38,23 @@ if (API_KEY) {
   }
 }
 
-// Model to use (single-call)
 const MODEL_NAME = "gpt-5-mini";
 
-// ----------------- Small helpers (only for safe trimming) -----------------
+// safe trimming
 const safeString = (v) => (v === undefined || v === null) ? "" : String(v).trim();
 
-// Try extract JSON object from messy AI text (still required because model may add text)
+// try to parse JSON blob from model text output
 function tryParseJsonFromText(text) {
   if (!text) return null;
   const txt = String(text).trim();
 
-  // 1) try direct parse if the whole text is JSON
+  // direct parse
   try {
     const maybe = JSON.parse(txt);
     if (maybe && typeof maybe === 'object') return maybe;
   } catch (e) { /* ignore */ }
 
-  // 2) find the first {...} block (balanced-ish) and attempt parse
+  // first {...} block
   const firstBrace = txt.indexOf('{');
   const lastBrace = txt.lastIndexOf('}');
   if (firstBrace >= 0 && lastBrace > firstBrace) {
@@ -64,26 +62,24 @@ function tryParseJsonFromText(text) {
     try {
       return JSON.parse(raw);
     } catch (e) {
-      // try to safe-quote keys/values and fix common issues
       try {
         const safe = raw
-          .replace(/([{,]\s*)([A-Za-z0-9_]+)\s*:/g, '$1"$2":') // quote keys
-          .replace(/(['`])([^'`]*?)\1/g, function(_,qd,inner){ return JSON.stringify(inner); }) // quoted values -> JSON string form
-          .replace(/:\s*([A-Za-z0-9\-\_\.]+)([,\n\r}])/g, function(_,v,post){ // unquoted simple values -> quote them
-            if (/^[-]?\d+(\.\d+)?$/.test(v)) return ':' + v + post; // numbers keep
-            if (/^(true|false|null)$/i.test(v)) return ':' + v + post; // booleans/null keep
+          .replace(/([{,]\s*)([A-Za-z0-9_]+)\s*:/g, '$1"$2":')
+          .replace(/(['`])([^'`]*?)\1/g, function(_,qd,inner){ return JSON.stringify(inner); })
+          .replace(/:\s*([A-Za-z0-9\-\_\.]+)([,\n\r}])/g, function(_,v,post){
+            if (/^[-]?\d+(\.\d+)?$/.test(v)) return ':' + v + post;
+            if (/^(true|false|null)$/i.test(v)) return ':' + v + post;
             return ':' + JSON.stringify(v) + post;
           })
-          .replace(/,(\s*[}\]])/g, "$1"); // remove trailing commas
+          .replace(/,(\s*[}\]])/g, "$1");
         return JSON.parse(safe);
       } catch (e2) {
-        // give up
         return null;
       }
     }
   }
 
-  // 3) fallback: try to extract a {...} with regex greedy (less safe)
+  // greedy fallback
   const jmatch = txt.match(/\{[\s\S]*\}/);
   if (!jmatch) return null;
   try {
@@ -93,36 +89,64 @@ function tryParseJsonFromText(text) {
   }
 }
 
-// ----------------- Build strict prompt -----------------
-function buildStrictPrompt(message) {
-  // sanitize triple quotes in message to avoid prompt breakage
-  const safeMessage = String(message).replace(/```/g, '``` ').replace(/\r/g, '\n');
-  return `
-You are a logistics parser. Extract the following fields EXACTLY and return ONLY a single JSON object and NOTHING ELSE. Do NOT add any commentary.
+// Post-process truck number to match example: remove non-alphanumerics and uppercase
+function normalizeTruckNumber(raw) {
+  if (!raw) return "";
+  let s = String(raw).trim();
+  const specialPattern = /\b(brllgada|bellgade|bellgad|bellgadi|new truck|new tractor|new gadi)\b/i;
+  if (specialPattern.test(s)) {
+    const m = s.match(specialPattern);
+    return m ? m[0] : s;
+  }
+  const cleaned = s.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+  return cleaned;
+}
 
-Schema (all fields must exist; when not found, set to empty string ""):
+// Build user's custom prompt (inserts message safely)
+function buildUserPrompt(message) {
+  const safeMessage = String(message || "").replace(/"/g, '\\"').replace(/\r/g, '\n');
+  const prompt = `
+You are a smart logistics parser.
+
+Extract the following mandatory details from this message:
+
+- truckNumber (which may be 9 or 10 characters long, possibly containing spaces or hyphens) 
+  Example: "MH 09 HH 4512" should be returned as "MH09HH4512"
+- to
+- weight
+- description
+
+Also, extract the optional fields:
+- from (this is optional but often present)
+- name (if the message contains a pattern like "n - name", "n-name", " n name", " n. name", or any variation where 'n' is followed by '-' or '.' or space, and then the person's name — extract the text after it as the name value)
+
+If truckNumber is missing, but the message contains words like "brllgada","bellgade","bellgad","bellgadi","new truck", "new tractor", or "new gadi", 
+then set truckNumber to that phrase (exactly as it appears).
+
+If the weight contains the word "fix" or similar, preserve it as-is.
+
+Here is the message:
+"${safeMessage}"
+
+Return the extracted information strictly in the following JSON format:
+
 {
-  "truckNumber": "",
-  "from": "",
-  "to": "",
-  "weight": "",
-  "description": "",
-  "name": ""
+  "truckNumber": "",    // mandatory
+  "from": "",           // optional
+  "to": "",             // mandatory
+  "weight": "",         // mandatory
+  "description": "",    // mandatory
+  "name": ""            // optional
 }
 
-Requirements:
-- Return a single valid JSON object only (no markdown, no code fences, no extra text).
-- Do NOT attempt to guess or infer fields beyond what is explicitly present in the message text. If a field is not present, set it to "".
-- Keep original spelling/casing for fields as they appear (do not change to uppercase/lowercase).
-- If truckNumber contains spaces or hyphens in the message, preserve them as-is in the returned value.
-- If the message contains phrases like "new truck", "new gadi", etc., and there's no plate, leave truckNumber as "" unless that phrase is explicitly the value you want returned.
+If any field is missing, return it as an empty string.
 
-Message:
-"""${safeMessage}"""
+Ensure the output is only the raw JSON — no extra text, notes, or formatting outside the JSON structure.
 `.trim();
+  return prompt;
 }
 
-// ----------------- Single AI call (patched) -----------------
+// Single AI call supporting multiple SDK shapes
 async function singleAiCall(prompt) {
   if (!API_KEY || !openai) {
     console.warn("[lrExtractor] No API key/client available: skipping AI call.");
@@ -130,39 +154,35 @@ async function singleAiCall(prompt) {
   }
 
   try {
-    // 1) Older SDK shape: openai.chat.completions.create
+    // Older SDK shape
     if (typeof openai.chat?.completions?.create === 'function') {
-      // NOTE: many modern models/SDKs reject `max_tokens` for chat completions; use `max_completion_tokens`
       const resp = await openai.chat.completions.create({
         model: MODEL_NAME,
         messages: [{ role: "user", content: prompt }],
-        max_completion_tokens: 600,
-        temperature: 0
+        // use max_completion_tokens for SDKs rejecting max_tokens
+        max_completion_tokens: 600
+        // no temperature provided — allow model default
       });
-      // different SDKs place content in different paths — try common ones
       const choice = resp?.choices?.[0];
       const content = choice?.message?.content || choice?.text || choice?.delta?.content || "";
       return String(content || "");
     }
 
-    // 2) Newer SDK shape: openai.responses.create
+    // Newer SDK shape
     if (typeof openai.responses?.create === 'function') {
       const resp = await openai.responses.create({
         model: MODEL_NAME,
         input: prompt,
-        max_output_tokens: 600,
-        temperature: 0
+        max_output_tokens: 600
+        // no temperature provided — allow model default
       });
 
-      // Extract text robustly from `resp`
-      // resp.output may be an array of { content: [{ type: 'output_text', text: '...' }, ...] }
       let text = '';
       try {
         if (resp.output && Array.isArray(resp.output)) {
           for (const item of resp.output) {
             if (item.content && Array.isArray(item.content)) {
               for (const c of item.content) {
-                // some SDKs use 'text', others 'content[0].text' or 'content[0].parts'
                 if (typeof c.text === 'string') text += c.text;
                 if (Array.isArray(c.parts)) text += c.parts.join('');
                 if (typeof c === 'string') text += c;
@@ -173,22 +193,18 @@ async function singleAiCall(prompt) {
           }
         }
       } catch (e) {
-        // fallback to output_text or output_text fields some SDKs provide
         text = text || resp.output_text || resp.outputText || '';
       }
 
-      // final fallback
       if (!text && resp.output_text) text = resp.output_text;
       if (!text && resp.outputText) text = resp.outputText;
 
       return String(text || '');
     }
 
-    // unknown SDK shape
     console.warn("[lrExtractor] openai SDK shape unrecognized; skipping AI call.");
     return "";
   } catch (err) {
-    // log full error for debugging
     console.error("[lrExtractor] AI call error:", err && err.message ? err.message : String(err));
     if (err && err.response && err.response.data) {
       try { console.error("[lrExtractor] AI error response data:", JSON.stringify(err.response.data)); } catch(e){}
@@ -199,42 +215,50 @@ async function singleAiCall(prompt) {
   }
 }
 
-// ----------------- Public API -----------------
 async function extractDetails(message) {
   const startTs = Date.now();
   console.log("[lrExtractor] extractDetails called. Snippet:", String(message || "").slice(0,300).replace(/\n/g, ' | '));
 
-  // Empty message -> return schema with empty strings
   if (!message) {
     return { truckNumber: "", from: "", to: "", weight: "", description: "", name: "" };
   }
 
-  const prompt = buildStrictPrompt(message);
+  const prompt = buildUserPrompt(message);
 
-  // SINGLE call only (per request)
+  // single AI call
   const aiText = await singleAiCall(prompt);
   if (!aiText) {
     console.warn("[lrExtractor] AI returned empty response -> returning empty fields.");
     return { truckNumber: "", from: "", to: "", weight: "", description: "", name: "" };
   }
 
-  // Try parse JSON from the model output
+  // parse JSON
   const parsed = tryParseJsonFromText(aiText);
   if (parsed && typeof parsed === "object") {
-    // Ensure all keys exist and are strings; do NOT apply extra inference/normalization.
+    // Extract fields safely
+    const rawTruck = safeString(parsed.truckNumber);
+    const from = safeString(parsed.from);
+    const to = safeString(parsed.to);
+    const weight = safeString(parsed.weight);
+    const description = safeString(parsed.description);
+    const name = safeString(parsed.name);
+
+    // Post-process truck number according to user's example
+    const normalizedTruck = normalizeTruckNumber(rawTruck || '');
+
     const out = {
-      truckNumber: safeString(parsed.truckNumber),
-      from: safeString(parsed.from),
-      to: safeString(parsed.to),
-      weight: safeString(parsed.weight),
-      description: safeString(parsed.description),
-      name: safeString(parsed.name)
+      truckNumber: normalizedTruck,
+      from,
+      to,
+      weight,
+      description,
+      name
     };
+
     console.log("[lrExtractor] Parsed result (took ms):", Date.now() - startTs, out);
     return out;
   }
 
-  // Could not parse JSON -> return empty schema (no fallback)
   console.warn("[lrExtractor] Could not parse JSON from AI output -> returning empty fields. Raw AI text:", aiText.slice(0,1000));
   return { truckNumber: "", from: "", to: "", weight: "", description: "", name: "" };
 }
