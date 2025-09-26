@@ -1,7 +1,40 @@
-// lrExtractor.js — OpenAI (gpt-5-nano) based LR extractor with verbose console logging
-// Uses process.env.key only (NO dotenv, NO hardcoded API key).
+// lrExtractor.js — OpenAI (gpt-5-nano) LR extractor with normalization and debug of env key.
+// Reads process.env.GEMINI_API_KEY, normalizes it (strips newlines/leading '='/quotes), logs masked preview.
 
-const API_KEY = process.env.GEMINI_API_KEY; // env var name: "key"
+'use strict';
+
+// ----------------- API KEY normalization & debug (DO NOT leave verbose logging in production) -----------------
+const rawEnvVal = process.env.GEMINI_API_KEY;
+
+// Print a JSON-escaped preview of the raw environment variable (first 300 chars) so you can spot newlines, leading '=' or other invisible chars.
+// This prints control characters escaped (e.g. \n) — useful to debug invalid header values.
+try {
+  const rawPreview = typeof rawEnvVal === 'string' ? JSON.stringify(rawEnvVal).slice(0, 600) : String(rawEnvVal);
+  console.log('[lrExtractor] DEBUG raw GEMINI_API_KEY preview (JSON-escaped, truncated):', rawPreview);
+} catch (e) {
+  console.warn('[lrExtractor] DEBUG: could not JSON.stringify raw GEMINI_API_KEY:', e && e.message ? e.message : e);
+}
+
+// Normalize: remove BOM, newlines, surrounding quotes, and accidental leading '=' chars.
+let API_KEY = '';
+if (typeof rawEnvVal === 'string' && rawEnvVal.length) {
+  API_KEY = rawEnvVal
+    .replace(/^\uFEFF/, '')        // strip BOM
+    .replace(/[\r\n]+/g, '')       // remove newlines
+    .trim()                        // trim whitespace
+    .replace(/^["']|["']$/g, '')   // strip surrounding quotes
+    .replace(/^[=]+/, '');         // strip leading '=' characters if accidentally pasted
+}
+
+// Masked key logging (show prefix only) so you can confirm normalization succeeded without exposing full key.
+if (!API_KEY) {
+  console.warn('[lrExtractor] API key missing after normalization. AI calls will be skipped.');
+} else {
+  const masked = API_KEY.length > 10 ? API_KEY.slice(0, 6) + '...' + API_KEY.slice(-4) : API_KEY.slice(0, 4) + '...';
+  console.log('[lrExtractor] API key normalized (masked):', masked);
+}
+
+// ----------------- Model / settings -----------------
 const SELECTED_MODEL = "gpt-5-nano";
 let rateLimitResetTs = 0;
 
@@ -9,7 +42,7 @@ let rateLimitResetTs = 0;
 const EMPTY_OUT = { truckNumber: "", from: "", to: "", weight: "", description: "", name: "" };
 
 if (!API_KEY) {
-  console.warn("[lrExtractor] process.env.key is not set. AI calls will be skipped until this env var is provided.");
+  console.warn("[lrExtractor] No valid API key available (process.env.GEMINI_API_KEY). AI calls will be skipped.");
 }
 
 // ----------------- Helpers -----------------
@@ -83,7 +116,7 @@ async function aiCallWithRateLimit(prompt) {
   }
 
   if (!API_KEY) {
-    console.warn("[lrExtractor] No OPENAI API key (process.env.key) — skipping AI call.");
+    console.warn("[lrExtractor] No OPENAI API key available — skipping AI call.");
     return "";
   }
 
