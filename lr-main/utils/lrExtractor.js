@@ -128,7 +128,7 @@ async function aiCallWithRateLimit(prompt) {
     const body = {
       model: SELECTED_MODEL,
       input: prompt,
-      temperature: 0,
+     
       max_output_tokens: 600
     };
 
