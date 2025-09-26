@@ -225,6 +225,21 @@ async function extractDetails(message) {
         name: parsed.name ? String(parsed.name).trim() : ""
       };
 
+      // ----------- ONLY FIX: if AI omitted 'from', try "A to B" extraction from original message -----------
+      if ((!out.from || out.from.trim() === "") && message) {
+        const m = String(message).match(/(.+?)\s*(?:to|->|→|–|—|-)\s*(.+)/i);
+        if (m) {
+          const candidateFrom = m[1].trim();
+          // avoid treating truck plates or pure numbers as 'from'
+          const isPlate = /^[A-Za-z]{2}\s?\d{1,2}\s?[A-Za-z]{1,3}\s?\d{1,4}$/i.test(candidateFrom);
+          const isNumber = /^\d+(\.\d+)?$/.test(candidateFrom.replace(/\s+/g,''));
+          if (!isPlate && !isNumber) {
+            out.from = candidateFrom;
+          }
+        }
+      }
+      // -----------------------------------------------------------------------------------------------
+
       // normalize truck unless it's a special phrase
       const specials = ["new truck","new tractor","new gadi","bellgadi","bellgada","bellgade","bellgad","brllgada"];
       if (out.truckNumber && !specials.includes(out.truckNumber.toLowerCase())) out.truckNumber = normalizeTruck(out.truckNumber);
