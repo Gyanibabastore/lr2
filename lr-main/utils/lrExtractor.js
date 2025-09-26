@@ -1,5 +1,6 @@
-// lrExtractor.js — OpenAI (gpt-5-nano) LR extractor with normalization and debug of env key.
+// lrExtractor.js — OpenAI (gpt-5-mini) LR extractor with normalization and debug of env key.
 // Reads process.env.GEMINI_API_KEY, normalizes it (strips newlines/leading '='/quotes), logs masked preview.
+// Modified to call the AI exactly once per extractDetails invocation.
 
 'use strict';
 
@@ -35,6 +36,7 @@ if (!API_KEY) {
 }
 
 // ----------------- Model / settings -----------------
+// You set this to a model that accepts the parameters your code sends.
 const SELECTED_MODEL = "gpt-5-mini";
 
 let rateLimitResetTs = 0;
@@ -128,7 +130,7 @@ async function aiCallWithRateLimit(prompt) {
     const body = {
       model: SELECTED_MODEL,
       input: prompt,
-     
+      temperature: 0,
       max_output_tokens: 600
     };
 
@@ -273,6 +275,7 @@ Use exactly this schema (fields must exist; use empty string "" when a field is 
 }
 
 // ----------------- Public API (OpenAI-based extraction) -----------------
+// NOTE: This version calls AI exactly once (no retry loop)
 async function extractDetails(message) {
   const startTs = Date.now();
   console.log("[lrExtractor] extractDetails called. Message snippet:", String(message || "").slice(0,300).replace(/\n/g, ' | '));
@@ -284,116 +287,166 @@ async function extractDetails(message) {
 
   const prompt = buildStrictPrompt(message);
 
-  // Always use AI (3 attempts)
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const attemptNote = attempt === 0 ? "" : attempt === 1 ? "\nNOTE: Return JSON only, ensure keys exist." : "\nFINAL: If unsure, leave empty.";
-    const fullPrompt = prompt + attemptNote;
-    console.log(`[lrExtractor] AI attempt ${attempt+1} - sending prompt (chars):`, fullPrompt.length);
+  // Single AI call only
+  console.log(`[lrExtractor] AI single attempt - sending prompt (chars):`, prompt.length);
 
-    const aiText = await aiCallWithRateLimit(fullPrompt);
-    if (!aiText) {
-      console.warn(`[lrExtractor] AI attempt ${attempt+1} returned empty response. (attemptNote: "${attemptNote.trim()}")`);
-      await sleep(200 * (attempt + 1)); // small backoff
-      continue;
-    }
+  const aiText = await aiCallWithRateLimit(prompt);
+  if (!aiText) {
+    console.warn(`[lrExtractor] AI single attempt returned empty response.`);
+    // Attempt best-effort manual parsing fallback (lightweight) BEFORE returning empty:
+    // Try to extract obvious fields locally to reduce false negatives.
+    try {
+      const lines = String(message).split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+      const combined = lines.join(' | ');
+      console.debug && console.debug("[lrExtractor] Fallback local parse lines:", lines);
 
-    console.log(`[lrExtractor] AI raw response received (length ${aiText.length}). Attempt ${attempt+1}.`);
-    console.debug && console.debug(`[lrExtractor] AI response snippet (1k):\n${String(aiText).slice(0,1200)}`);
+      // Try truck plate pattern (very permissive)
+      let truckCandidate = "";
+      for (const l of lines) {
+        const m = l.match(/\b([A-Za-z]{2}\s*\d{1,2}\s*[A-Za-z]{1,3}\s*\d{1,4})\b/i);
+        if (m) { truckCandidate = m[1]; break; }
+      }
 
-    const parsed = tryParseJsonFromText(aiText);
-    if (parsed && typeof parsed === "object") {
-      console.log(`[lrExtractor] AI parsed JSON (raw object):`, parsed);
+      // Try A to B for from/to
+      let from = "", to = "";
+      const mTo = combined.match(/(.+?)\s*(?:to|->|→|–|—|-)\s*(.+)/i);
+      if (mTo) {
+        from = mTo[1].trim();
+        to = mTo[2].trim();
+      }
 
-      // sanitize & normalize
+      // Try weight line (first numeric-looking line)
+      let weight = "";
+      for (const l of lines.slice().reverse()) {
+        const num = parseNumberLike(l);
+        if (num) { weight = num; break; }
+      }
+
+      // description: first non-plate, non-weight short line
+      let description = "";
+      for (const l of lines) {
+        if (l && l.length < 60 && !l.match(/^[A-Za-z]{2}\s*\d/)) {
+          if (!description && !l.match(/^\d/)) {
+            description = l;
+            break;
+          }
+        }
+      }
+
       const out = {
-        truckNumber: parsed.truckNumber ? String(parsed.truckNumber).trim() : "",
-        from: parsed.from ? String(parsed.from).trim() : "",
-        to: parsed.to ? String(parsed.to).trim() : "",
-        weight: parsed.weight ? String(parsed.weight).trim() : "",
-        description: parsed.description ? String(parsed.description).trim() : "",
-        name: parsed.name ? String(parsed.name).trim() : ""
+        truckNumber: truckCandidate ? normalizeTruck(truckCandidate) : "",
+        from: from ? capitalize(from) : "",
+        to: to ? capitalize(to) : "",
+        weight: weight ? (Number(weight) > 0 && Number(weight) < 100 ? String(Math.round(Number(weight) * 1000)) : String(Math.round(Number(weight))) ) : "",
+        description: description ? capitalize(description) : "",
+        name: ""
       };
 
-      console.debug && console.debug("[lrExtractor] After initial sanitization:", out);
-
-      // ----------- ONLY FIX: if AI omitted 'from', try "A to B" extraction from original message -----------
-      if ((!out.from || out.from.trim() === "") && message) {
-        const m = String(message).match(/(.+?)\s*(?:to|->|→|–|—|-)\s*(.+)/i);
-        if (m) {
-          const candidateFrom = m[1].trim();
-          const isPlate = /^[A-Za-z]{2}\s?\d{1,2}\s?[A-Za-z]{1,3}\s?\d{1,4}$/i.test(candidateFrom);
-          const isNumber = /^\d+(\.\d+)?$/.test(candidateFrom.replace(/\s+/g,''));
-          if (!isPlate && !isNumber) {
-            out.from = candidateFrom;
-            console.debug && console.debug("[lrExtractor] from inferred from 'A to B' pattern:", out.from);
-          } else {
-            console.debug && console.debug("[lrExtractor] 'from' candidate rejected as plate/number:", candidateFrom);
-          }
-        } else {
-          console.debug && console.debug("[lrExtractor] No 'A to B' pattern found for 'from' inference.");
-        }
-      }
-      // -----------------------------------------------------------------------------------------------
-
-      // normalize truck unless it's a special phrase
-      const specials = ["new truck","new tractor","new gadi","bellgadi","bellgada","bellgade","bellgad","brllgada"];
-      if (out.truckNumber && !specials.includes(out.truckNumber.toLowerCase())) {
-        const before = out.truckNumber;
-        out.truckNumber = normalizeTruck(out.truckNumber);
-        console.debug && console.debug("[lrExtractor] truckNumber normalized:", before, "->", out.truckNumber);
-      } else if (out.truckNumber) {
-        console.debug && console.debug("[lrExtractor] truckNumber left as special phrase:", out.truckNumber);
-      }
-
-      if (out.from) out.from = capitalize(out.from);
-      if (out.to) out.to = capitalize(out.to);
-      if (out.description) out.description = capitalize(out.description);
-      if (out.name) out.name = capitalize(out.name);
-
-      console.debug && console.debug("[lrExtractor] After capitalization:", {
-        truckNumber: out.truckNumber,
-        from: out.from,
-        to: out.to,
-        description: out.description,
-        name: out.name
-      });
-
-      // weight normalization (preserve 'fix')
-      if (out.weight && !/fix/i.test(out.weight)) {
-        const wn = String(out.weight).replace(/,/g,"");
-        const n = parseFloat(wn);
-        if (!isNaN(n)) {
-          const beforeW = out.weight;
-          if (n > 0 && n < 100) out.weight = Math.round(n * 1000).toString();
-          else out.weight = Math.round(n).toString();
-          console.debug && console.debug("[lrExtractor] weight normalized:", beforeW, "->", out.weight);
-        } else {
-          console.debug && console.debug("[lrExtractor] weight parseFloat produced NaN — left as-is:", out.weight);
-        }
-      } else if (out.weight) {
-        console.debug && console.debug("[lrExtractor] weight contains 'fix' — preserving as-is:", out.weight);
-      }
-
       const mandatoryPresent = out.truckNumber && out.to && out.weight && out.description;
-      console.debug && console.debug("[lrExtractor] mandatoryPresent check:", mandatoryPresent);
-
       if (mandatoryPresent) {
-        console.log("[lrExtractor] SUCCESS ✅ Took(ms):", Date.now() - startTs, "Final:", out);
+        console.log("[lrExtractor] FALLBACK SUCCESS (local parse) ✅ Took(ms):", Date.now() - startTs, "Final:", out);
         return out;
       } else {
-        console.warn("[lrExtractor] Attempt failed (missing mandatory fields). Current out:", out);
+        console.warn("[lrExtractor] FALLBACK incomplete — returning empty fields. Candidate:", out);
       }
-    } else {
-      console.warn(`[lrExtractor] AI attempt ${attempt+1} produced unparseable output.`);
+    } catch (e) {
+      console.error("[lrExtractor] Fallback local parse error:", e && e.message ? e.message : e);
     }
 
-    // small backoff before next attempt
-    await sleep(400 * (attempt + 1));
+    return { ...EMPTY_OUT };
   }
 
-  // AI failed all attempts -> return empty fields (no fallback)
-  console.warn("[lrExtractor] AI failed after attempts — returning empty fields (NO fallback).");
-  return { ...EMPTY_OUT };
+  console.log(`[lrExtractor] AI raw response received (length ${aiText.length}).`);
+  console.debug && console.debug(`[lrExtractor] AI response snippet (1k):\n${String(aiText).slice(0,1200)}`);
+
+  const parsed = tryParseJsonFromText(aiText);
+  if (parsed && typeof parsed === "object") {
+    console.log(`[lrExtractor] AI parsed JSON (raw object):`, parsed);
+
+    // sanitize & normalize
+    const out = {
+      truckNumber: parsed.truckNumber ? String(parsed.truckNumber).trim() : "",
+      from: parsed.from ? String(parsed.from).trim() : "",
+      to: parsed.to ? String(parsed.to).trim() : "",
+      weight: parsed.weight ? String(parsed.weight).trim() : "",
+      description: parsed.description ? String(parsed.description).trim() : "",
+      name: parsed.name ? String(parsed.name).trim() : ""
+    };
+
+    console.debug && console.debug("[lrExtractor] After initial sanitization:", out);
+
+    // ----------- ONLY FIX: if AI omitted 'from', try "A to B" extraction from original message -----------
+    if ((!out.from || out.from.trim() === "") && message) {
+      const m = String(message).match(/(.+?)\s*(?:to|->|→|–|—|-)\s*(.+)/i);
+      if (m) {
+        const candidateFrom = m[1].trim();
+        const isPlate = /^[A-Za-z]{2}\s?\d{1,2}\s?[A-Za-z]{1,3}\s?\d{1,4}$/i.test(candidateFrom);
+        const isNumber = /^\d+(\.\d+)?$/.test(candidateFrom.replace(/\s+/g,''));
+        if (!isPlate && !isNumber) {
+          out.from = candidateFrom;
+          console.debug && console.debug("[lrExtractor] from inferred from 'A to B' pattern:", out.from);
+        } else {
+          console.debug && console.debug("[lrExtractor] 'from' candidate rejected as plate/number:", candidateFrom);
+        }
+      } else {
+        console.debug && console.debug("[lrExtractor] No 'A to B' pattern found for 'from' inference.");
+      }
+    }
+    // -----------------------------------------------------------------------------------------------
+
+    // normalize truck unless it's a special phrase
+    const specials = ["new truck","new tractor","new gadi","bellgadi","bellgada","bellgade","bellgad","brllgada"];
+    if (out.truckNumber && !specials.includes(out.truckNumber.toLowerCase())) {
+      const before = out.truckNumber;
+      out.truckNumber = normalizeTruck(out.truckNumber);
+      console.debug && console.debug("[lrExtractor] truckNumber normalized:", before, "->", out.truckNumber);
+    } else if (out.truckNumber) {
+      console.debug && console.debug("[lrExtractor] truckNumber left as special phrase:", out.truckNumber);
+    }
+
+    if (out.from) out.from = capitalize(out.from);
+    if (out.to) out.to = capitalize(out.to);
+    if (out.description) out.description = capitalize(out.description);
+    if (out.name) out.name = capitalize(out.name);
+
+    console.debug && console.debug("[lrExtractor] After capitalization:", {
+      truckNumber: out.truckNumber,
+      from: out.from,
+      to: out.to,
+      description: out.description,
+      name: out.name
+    });
+
+    // weight normalization (preserve 'fix')
+    if (out.weight && !/fix/i.test(out.weight)) {
+      const wn = String(out.weight).replace(/,/g,"");
+      const n = parseFloat(wn);
+      if (!isNaN(n)) {
+        const beforeW = out.weight;
+        if (n > 0 && n < 100) out.weight = Math.round(n * 1000).toString();
+        else out.weight = Math.round(n).toString();
+        console.debug && console.debug("[lrExtractor] weight normalized:", beforeW, "->", out.weight);
+      } else {
+        console.debug && console.debug("[lrExtractor] weight parseFloat produced NaN — left as-is:", out.weight);
+      }
+    } else if (out.weight) {
+      console.debug && console.debug("[lrExtractor] weight contains 'fix' — preserving as-is:", out.weight);
+    }
+
+    const mandatoryPresent = out.truckNumber && out.to && out.weight && out.description;
+    console.debug && console.debug("[lrExtractor] mandatoryPresent check:", mandatoryPresent);
+
+    if (mandatoryPresent) {
+      console.log("[lrExtractor] SUCCESS ✅ Took(ms):", Date.now() - startTs, "Final:", out);
+      return out;
+    } else {
+      console.warn("[lrExtractor] AI parsed but missing mandatory fields. Current out:", out);
+      return { ...EMPTY_OUT };
+    }
+  } else {
+    console.warn("[lrExtractor] AI returned unparseable output — returning empty fields.");
+    return { ...EMPTY_OUT };
+  }
 }
 
 async function isStructuredLR(message) {
