@@ -1,8 +1,8 @@
 // sendPDF.js
 const fs = require('fs');
-const path = require('path');
 const axios = require('axios');
 const FormData = require('form-data');
+const path = require('path');
 const { normalizePhone } = require('./utils/phone');
 
 const subadminPath = path.join(__dirname, './subadmin.json');
@@ -10,14 +10,13 @@ const subadminPath = path.join(__dirname, './subadmin.json');
 async function sendPDF(to, filePath, templateNumber = null, originalMessage = '', truckNumber = null) {
   const phoneId = process.env.PHONE_NUMBER_ID;
   const token = process.env.WHATSAPP_TOKEN;
-  const adminRaw = process.env.ADMIN_NUMBER;
+  const adminNumberRaw = process.env.ADMIN_NUMBER;
 
   if (!phoneId || !token) {
     console.error('❌ PHONE_NUMBER_ID or WHATSAPP_TOKEN not set in env');
     throw new Error('WhatsApp credentials missing');
   }
 
-  // load subadmins if present
   let subadminNumbers = [];
   try {
     if (fs.existsSync(subadminPath)) {
@@ -29,9 +28,9 @@ async function sendPDF(to, filePath, templateNumber = null, originalMessage = ''
     console.error('❌ Could not read subadmin.json:', e.message);
   }
 
-  // Prepare recipients
+  // Normalize recipients
   const userNumber = normalizePhone(to);
-  const adminNumber = normalizePhone(adminRaw);
+  const adminNumber = normalizePhone(adminNumberRaw);
   const subadmins = Array.isArray(subadminNumbers) ? subadminNumbers.map(normalizePhone).filter(Boolean) : [];
 
   if (!userNumber) {
@@ -47,7 +46,7 @@ async function sendPDF(to, filePath, templateNumber = null, originalMessage = ''
     fs.mkdirSync(tempDir, { recursive: true });
     fs.copyFileSync(filePath, renamedPath);
 
-    // Upload media
+    // Upload PDF to WhatsApp
     const form = new FormData();
     form.append('file', fs.createReadStream(renamedPath));
     form.append('type', 'application/pdf');
@@ -69,14 +68,14 @@ async function sendPDF(to, filePath, templateNumber = null, originalMessage = ''
 
     console.log('📎 Media uploaded. ID:', mediaId);
 
-    // Send document to user
+    // Send to user
     const sendUrl = `https://graph.facebook.com/v19.0/${phoneId}/messages`;
     const dateStr = new Date().toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' });
 
     const userPayload = {
-      messaging_product: "whatsapp",
+      messaging_product: 'whatsapp',
       to: userNumber,
-      type: "document",
+      type: 'document',
       document: {
         id: mediaId,
         caption: `Date: ${dateStr}`,
@@ -93,7 +92,7 @@ async function sendPDF(to, filePath, templateNumber = null, originalMessage = ''
 
     console.log('✅ PDF sent to user:', userNumber);
 
-    // Send to admin + subadmins (if valid)
+    // Send to admin + subadmins
     const extras = [adminNumber, ...subadmins].filter(Boolean);
     for (const num of extras) {
       try {
@@ -106,9 +105,9 @@ async function sendPDF(to, filePath, templateNumber = null, originalMessage = ''
           `📝 ${originalMessage || '-'}`,
         ];
         const adminPayload = {
-          messaging_product: "whatsapp",
+          messaging_product: 'whatsapp',
           to: num,
-          type: "document",
+          type: 'document',
           document: {
             id: mediaId,
             caption: captionLines.join('\n'),
@@ -133,16 +132,15 @@ async function sendPDF(to, filePath, templateNumber = null, originalMessage = ''
 
   } catch (err) {
     const errorMessage = err?.response?.data?.error?.message || err.message || String(err);
-    console.error('❌ Error in sendPDF:', errorMessage);
+    console.error('❌ Error sending PDF:', errorMessage);
 
-    // Notify admin if possible
-    const adminToNotify = adminNumber;
-    if (adminToNotify) {
+    // Notify admin of failure (if admin configured)
+    if (adminNumber) {
       try {
         const failMsg = `❌ *PDF failed to send*\nTo: ${to}\nReason: ${errorMessage}\n\n📝 ${originalMessage || '-'}`;
         await axios.post(`https://graph.facebook.com/v19.0/${phoneId}/messages`, {
-          messaging_product: "whatsapp",
-          to: adminToNotify,
+          messaging_product: 'whatsapp',
+          to: adminNumber,
           text: { body: failMsg },
         }, {
           headers: {
