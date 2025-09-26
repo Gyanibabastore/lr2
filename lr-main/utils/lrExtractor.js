@@ -1,111 +1,44 @@
 // utils/lrExtractor.js
-// ChatGPT (gpt-5-mini) single-call LR extractor (patched to remove temperature=0).
+// LR extractor using ONLY the model (retries up to 3 times).
 // Exports: extractDetails(message) and isStructuredLR(message)
+//
+// Behavior:
+// - Tries to get a strict JSON from model up to 3 attempts.
+// - Uses deterministic sampling (temperature: 0) when model supports it.
+// - If model never returns valid JSON, returns empty fields (no local fallback).
 
 'use strict';
-
 try { require('dotenv').config(); } catch (e) { /* ignore */ }
 
 const OpenAI = require('openai');
 
-// --- sanitize & load key from GEMINI_API_KEY (per your env) ---
-function cleanKey(k) {
-  if (!k) return '';
-  return String(k).trim().replace(/^["'=]+|["']+$/g, '');
-}
-function maskKey(k) {
-  if (!k) return '<missing>';
-  const s = String(k);
-  if (s.length <= 12) return s;
-  return s.slice(0, 6) + '...' + s.slice(-4);
-}
-
-const RAW_KEY = process.env.GEMINI_API_KEY || '';
-const API_KEY = cleanKey(RAW_KEY);
-
-if (!API_KEY) {
-  console.warn("[lrExtractor] WARNING: No API key found. Set process.env.GEMINI_API_KEY.");
-} else {
-  console.log("[lrExtractor] GEMINI_API_KEY preview:", maskKey(API_KEY));
-}
+// ---------- Config ----------
+const RAW_KEY = process.env.GEMINI_API_KEY || process.env.OPENAI_API_KEY || '';
+const API_KEY = (RAW_KEY || '').toString().trim().replace(/^["'=]+|["']+$/g, '');
+if (!API_KEY) console.warn("[lrExtractor] WARNING: No API key found. Set process.env.GEMINI_API_KEY or OPENAI_API_KEY.");
 
 let openai = null;
 if (API_KEY) {
-  try {
-    openai = new OpenAI({ apiKey: API_KEY });
-  } catch (e) {
-    console.warn("[lrExtractor] Failed to create OpenAI client:", e && e.message ? e.message : e);
-  }
+  try { openai = new OpenAI({ apiKey: API_KEY }); }
+  catch (e) { console.warn("[lrExtractor] Failed to create OpenAI client:", e && e.message ? e.message : e); }
 }
 
-const MODEL_NAME = "gpt-5-mini";
+// Default model: use gpt-4o (supports temperature). Override with LR_MODEL env var.
+const MODEL_NAME = process.env.LR_MODEL || "gpt-4o";
 
-// safe trimming
-const safeString = (v) => (v === undefined || v === null) ? "" : String(v).trim();
+// Heuristic: models with gpt-5 / o3 / reasoning often disallow sampling params
+const supportsSampling = !(/gpt-5|o3|reasoning|reasoner/i.test(MODEL_NAME));
 
-// try to parse JSON blob from model text output
-function tryParseJsonFromText(text) {
-  if (!text) return null;
-  const txt = String(text).trim();
+// Safe helpers
+const safeString = v => (v === undefined || v === null) ? "" : String(v).trim();
+const maskKey = k => { if(!k) return '<missing>'; const s=String(k); return s.length<=12? s : s.slice(0,6)+'...'+s.slice(-4); };
+if (API_KEY) console.log("[lrExtractor] API key preview:", maskKey(API_KEY), " Model:", MODEL_NAME);
 
-  // direct parse
-  try {
-    const maybe = JSON.parse(txt);
-    if (maybe && typeof maybe === 'object') return maybe;
-  } catch (e) { /* ignore */ }
-
-  // first {...} block
-  const firstBrace = txt.indexOf('{');
-  const lastBrace = txt.lastIndexOf('}');
-  if (firstBrace >= 0 && lastBrace > firstBrace) {
-    const raw = txt.slice(firstBrace, lastBrace + 1);
-    try {
-      return JSON.parse(raw);
-    } catch (e) {
-      try {
-        const safe = raw
-          .replace(/([{,]\s*)([A-Za-z0-9_]+)\s*:/g, '$1"$2":')
-          .replace(/(['`])([^'`]*?)\1/g, function(_,qd,inner){ return JSON.stringify(inner); })
-          .replace(/:\s*([A-Za-z0-9\-\_\.]+)([,\n\r}])/g, function(_,v,post){
-            if (/^[-]?\d+(\.\d+)?$/.test(v)) return ':' + v + post;
-            if (/^(true|false|null)$/i.test(v)) return ':' + v + post;
-            return ':' + JSON.stringify(v) + post;
-          })
-          .replace(/,(\s*[}\]])/g, "$1");
-        return JSON.parse(safe);
-      } catch (e2) {
-        return null;
-      }
-    }
-  }
-
-  // greedy fallback
-  const jmatch = txt.match(/\{[\s\S]*\}/);
-  if (!jmatch) return null;
-  try {
-    return JSON.parse(jmatch[0]);
-  } catch (e) {
-    return null;
-  }
-}
-
-// Post-process truck number to match example: remove non-alphanumerics and uppercase
-function normalizeTruckNumber(raw) {
-  if (!raw) return "";
-  let s = String(raw).trim();
-  const specialPattern = /\b(brllgada|bellgade|bellgad|bellgadi|new truck|new tractor|new gadi)\b/i;
-  if (specialPattern.test(s)) {
-    const m = s.match(specialPattern);
-    return m ? m[0] : s;
-  }
-  const cleaned = s.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
-  return cleaned;
-}
-
-// Build user's custom prompt (inserts message safely)
-function buildUserPrompt(message) {
+// ---------------- prompt builder (user's exact requirements embedded) ----------------
+function buildStrictPrompt(message) {
   const safeMessage = String(message || "").replace(/"/g, '\\"').replace(/\r/g, '\n');
-  const prompt = `
+  // Base prompt (user-specified). We will also add "Attempt #n" NOTE outside when retrying.
+  return `
 You are a smart logistics parser.
 
 Extract the following mandatory details from this message:
@@ -128,141 +61,159 @@ If the weight contains the word "fix" or similar, preserve it as-is.
 Here is the message:
 "${safeMessage}"
 
-Return the extracted information strictly in the following JSON format:
+Return the extracted information strictly in the following JSON format (ONLY the JSON, nothing else):
 
 {
-  "truckNumber": "",    // mandatory
-  "from": "",           // optional
-  "to": "",             // mandatory
-  "weight": "",         // mandatory
-  "description": "",    // mandatory
-  "name": ""            // optional
+  "truckNumber": "",
+  "from": "",
+  "to": "",
+  "weight": "",
+  "description": "",
+  "name": ""
 }
 
 If any field is missing, return it as an empty string.
 
-Ensure the output is only the raw JSON — no extra text, notes, or formatting outside the JSON structure.
+Important: Do not include any commentary, explanation, markdown, or text outside the JSON object. Only return the raw JSON object.
 `.trim();
-  return prompt;
 }
 
-// Single AI call supporting multiple SDK shapes
-async function singleAiCall(prompt) {
+// ---------------- parse model output into JSON (robust) ----------------
+function tryParseJsonFromText(text) {
+  if (!text) return null;
+  const txt = String(text).trim();
+  try {
+    const j = JSON.parse(txt);
+    if (j && typeof j === 'object') return j;
+  } catch (e) {
+    // try to extract first {...} block
+    const first = txt.indexOf('{'), last = txt.lastIndexOf('}');
+    if (first >= 0 && last > first) {
+      const sub = txt.slice(first, last + 1);
+      try { const j2 = JSON.parse(sub); if (j2 && typeof j2 === 'object') return j2; } catch (e2) {}
+    }
+  }
+  return null;
+}
+
+// ---------------- normalize truck number as per user's example ----------------
+function normalizeTruckNumber(raw) {
+  if (!raw) return "";
+  const s = String(raw).trim();
+  const specialPattern = /\b(brllgada|bellgade|bellgad|bellgadi|new truck|new tractor|new gadi)\b/i;
+  const m = s.match(specialPattern);
+  if (m) return m[0];
+  return s.replace(/[^A-Za-z0-9]/g, '').toUpperCase();
+}
+
+// ---------------- single AI request (handles both SDK shapes) ----------------
+async function modelCall(prompt, attempt = 1) {
   if (!API_KEY || !openai) {
     console.warn("[lrExtractor] No API key/client available: skipping AI call.");
     return "";
   }
 
   try {
-    // Older SDK shape
+    // chat completions older shape
     if (typeof openai.chat?.completions?.create === 'function') {
-      const resp = await openai.chat.completions.create({
+      const params = {
         model: MODEL_NAME,
         messages: [{ role: "user", content: prompt }],
-        // use max_completion_tokens for SDKs rejecting max_tokens
         max_completion_tokens: 600
-        // no temperature provided — allow model default
-      });
+      };
+      if (supportsSampling) params.temperature = 0;
+      const resp = await openai.chat.completions.create(params);
       const choice = resp?.choices?.[0];
       const content = choice?.message?.content || choice?.text || choice?.delta?.content || "";
       return String(content || "");
     }
 
-    // Newer SDK shape
+    // responses.create newer shape
     if (typeof openai.responses?.create === 'function') {
-      const resp = await openai.responses.create({
+      const params = {
         model: MODEL_NAME,
         input: prompt,
         max_output_tokens: 600
-        // no temperature provided — allow model default
-      });
+      };
+      if (supportsSampling) params.temperature = 0;
+      const resp = await openai.responses.create(params);
 
+      // extract text robustly
       let text = '';
-      try {
-        if (resp.output && Array.isArray(resp.output)) {
-          for (const item of resp.output) {
-            if (item.content && Array.isArray(item.content)) {
-              for (const c of item.content) {
-                if (typeof c.text === 'string') text += c.text;
-                if (Array.isArray(c.parts)) text += c.parts.join('');
-                if (typeof c === 'string') text += c;
-              }
-            } else if (typeof item === 'string') {
-              text += item;
+      if (resp.output && Array.isArray(resp.output)) {
+        for (const item of resp.output) {
+          if (item.content && Array.isArray(item.content)) {
+            for (const c of item.content) {
+              if (typeof c.text === 'string') text += c.text;
+              if (Array.isArray(c.parts)) text += c.parts.join('');
+              if (typeof c === 'string') text += c;
             }
+          } else if (typeof item === 'string') {
+            text += item;
           }
         }
-      } catch (e) {
-        text = text || resp.output_text || resp.outputText || '';
       }
-
-      if (!text && resp.output_text) text = resp.output_text;
-      if (!text && resp.outputText) text = resp.outputText;
-
+      if (!text) text = resp.output_text || resp.outputText || '';
       return String(text || '');
     }
 
     console.warn("[lrExtractor] openai SDK shape unrecognized; skipping AI call.");
     return "";
   } catch (err) {
-    console.error("[lrExtractor] AI call error:", err && err.message ? err.message : String(err));
+    // log errors
+    console.error("[lrExtractor] AI call error (attempt):", attempt, err && err.message ? err.message : err);
     if (err && err.response && err.response.data) {
       try { console.error("[lrExtractor] AI error response data:", JSON.stringify(err.response.data)); } catch(e){}
-    } else if (err && err.statusCode) {
-      console.error("[lrExtractor] AI error statusCode:", err.statusCode);
     }
     return "";
   }
 }
 
+// ---------------- Public API: extractDetails ----------------
 async function extractDetails(message) {
-  const startTs = Date.now();
-  console.log("[lrExtractor] extractDetails called. Snippet:", String(message || "").slice(0,300).replace(/\n/g, ' | '));
+  console.log("[lrExtractor] extractDetails called. Snippet:", String(message||'').slice(0,300).replace(/\n/g,' | '));
+  if (!message) return { truckNumber: "", from: "", to: "", weight: "", description: "", name: "" };
 
-  if (!message) {
-    return { truckNumber: "", from: "", to: "", weight: "", description: "", name: "" };
+  const basePrompt = buildStrictPrompt(message);
+  let aiText = "";
+  let parsed = null;
+
+  // Try up to 3 attempts. Each attempt we append a short note to be stricter.
+  for (let i=1; i<=3; i++) {
+    const prompt = (i === 1) ? basePrompt : (basePrompt + `\n\nIMPORTANT (Attempt ${i}): If you failed to return JSON previously, return ONLY the JSON object now with no extra text.`);
+    aiText = await modelCall(prompt, i);
+
+    if (!aiText) {
+      console.warn(`[lrExtractor] Model returned empty on attempt ${i}.`);
+      continue; // try next attempt
+    }
+
+    parsed = tryParseJsonFromText(aiText);
+    if (parsed && typeof parsed === 'object') {
+      // ensure all fields exist
+      parsed.truckNumber = safeString(parsed.truckNumber || "");
+      parsed.from = safeString(parsed.from || "");
+      parsed.to = safeString(parsed.to || "");
+      parsed.weight = safeString(parsed.weight || "");
+      parsed.description = safeString(parsed.description || "");
+      parsed.name = safeString(parsed.name || "");
+
+      // normalize truck
+      parsed.truckNumber = normalizeTruckNumber(parsed.truckNumber);
+      console.log("[lrExtractor] Parsed result (from model) on attempt", i, parsed);
+      return parsed;
+    } else {
+      console.warn(`[lrExtractor] Model returned unparsable/non-JSON on attempt ${i}. Raw:`, String(aiText).slice(0,1000));
+      // continue to next attempt
+    }
   }
 
-  const prompt = buildUserPrompt(message);
-
-  // single AI call
-  const aiText = await singleAiCall(prompt);
-  if (!aiText) {
-    console.warn("[lrExtractor] AI returned empty response -> returning empty fields.");
-    return { truckNumber: "", from: "", to: "", weight: "", description: "", name: "" };
-  }
-
-  // parse JSON
-  const parsed = tryParseJsonFromText(aiText);
-  if (parsed && typeof parsed === "object") {
-    // Extract fields safely
-    const rawTruck = safeString(parsed.truckNumber);
-    const from = safeString(parsed.from);
-    const to = safeString(parsed.to);
-    const weight = safeString(parsed.weight);
-    const description = safeString(parsed.description);
-    const name = safeString(parsed.name);
-
-    // Post-process truck number according to user's example
-    const normalizedTruck = normalizeTruckNumber(rawTruck || '');
-
-    const out = {
-      truckNumber: normalizedTruck,
-      from,
-      to,
-      weight,
-      description,
-      name
-    };
-
-    console.log("[lrExtractor] Parsed result (took ms):", Date.now() - startTs, out);
-    return out;
-  }
-
-  console.warn("[lrExtractor] Could not parse JSON from AI output -> returning empty fields. Raw AI text:", aiText.slice(0,1000));
+  // After 3 attempts: give up and return empty fields (no local extraction)
+  console.warn("[lrExtractor] All attempts exhausted — returning empty fields (no local fallback).");
   return { truckNumber: "", from: "", to: "", weight: "", description: "", name: "" };
 }
 
+// ---------------- Public API: isStructuredLR ----------------
 async function isStructuredLR(message) {
   try {
     const d = await extractDetails(message);
