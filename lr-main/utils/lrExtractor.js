@@ -257,7 +257,28 @@ async function extractDetails(message) {
         parsed.truckNumber = parsed.truckNumber.replace(/[\s\.\-]/g, '').toUpperCase();
       }
 
-      // ===== NEW: If from empty but to contains origin-destination pair, split it =====
+      // ---------- ADDED: Local deterministic regex on original message to extract origin/destination ----------
+      // Try to get from/to from original message first (handles cases where model missed 'from')
+      try {
+        const orig = String(message || "");
+        const msgMatch = orig.match(/([A-Za-z0-9\.\,\/\s&]{2,}?)\s*(?:-|–|—|\bto\b)\s*([A-Za-z0-9\.\,\/\s&]{2,})/i);
+        if (msgMatch) {
+          const msgOrigin = msgMatch[1].trim().replace(/^[\:\-]+|[\:\-]+$/g,'').trim();
+          const msgDest = msgMatch[2].trim().replace(/^[\:\-]+|[\:\-]+$/g,'').trim();
+          if (msgOrigin && !parsed.from) {
+            parsed.from = msgOrigin;
+            console.log(`[lrExtractor] Local regex found origin from message: '${parsed.from}'`);
+          }
+          if (msgDest && (!parsed.to || parsed.to.length < 3 || parsed.to.toLowerCase() === parsed.from.toLowerCase())) {
+            parsed.to = msgDest;
+            console.log(`[lrExtractor] Local regex found destination from message: '${parsed.to}'`);
+          }
+        }
+      } catch (e) {
+        console.warn('[lrExtractor] Local message regex failed:', e && e.message ? e.message : e);
+      }
+
+      // ===== NEW/FALLBACK: If from empty but to contains origin-destination pair, split parsed.to =====
       if ((!parsed.from || parsed.from.trim() === "") && parsed.to) {
         const td = parsed.to.trim();
         let splitMatch = td.match(/^(.+?)[\s\-–—]+(.+)$/);
