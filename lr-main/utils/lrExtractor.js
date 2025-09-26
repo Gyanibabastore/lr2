@@ -1,22 +1,13 @@
-// utils/lrExtractor.js
-// ChatGPT (gpt-5-mini) single-call LR extractor.
-// Exports: extractDetails(message) and isStructuredLR(message)
-//
-// Behavior changes per request:
-// - Uses OpenAI (gpt-5-mini) in a single API call (no retries).
-// - Does NOT apply local inference/heuristics to fabricate missing fields.
-// - Expects the model to return EXACTLY one JSON object (as per prompt).
-//
-// USAGE: set process.env.OPENAI_API_KEY
+
 
 'use strict';
 
-const fetch = global.fetch || require('node-fetch');
 const OpenAI = require('openai');
 
+// Use GEMINI_API_KEY per your environment
 const API_KEY = process.env.GEMINI_API_KEY || '';
 if (!API_KEY) {
-  console.warn("[lrExtractor] WARNING: No OpenAI API key found. Set process.env.OPENAI_API_KEY.");
+  console.warn("[lrExtractor] WARNING: No API key found. Set process.env.GEMINI_API_KEY.");
 }
 const openai = new OpenAI({ apiKey: API_KEY });
 
@@ -30,28 +21,54 @@ const safeString = (v) => (v === undefined || v === null) ? "" : String(v).trim(
 function tryParseJsonFromText(text) {
   if (!text) return null;
   const txt = String(text).trim();
-  // find first {...} block
+
+  // 1) try direct parse if the whole text is JSON
+  try {
+    const maybe = JSON.parse(txt);
+    if (maybe && typeof maybe === 'object') return maybe;
+  } catch (e) { /* ignore */ }
+
+  // 2) find the first {...} block (balanced-ish) and attempt parse
+  const firstBrace = txt.indexOf('{');
+  const lastBrace = txt.lastIndexOf('}');
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    const raw = txt.slice(firstBrace, lastBrace + 1);
+    try {
+      return JSON.parse(raw);
+    } catch (e) {
+      // try to safe-quote keys/values and fix common issues
+      try {
+        const safe = raw
+          .replace(/([{,]\s*)([A-Za-z0-9_]+)\s*:/g, '$1"$2":') // quote keys
+          .replace(/(['`])([^'`]*?)\1/g, function(_,qd,inner){ return JSON.stringify(inner); }) // quoted values -> JSON string form
+          .replace(/:\s*([A-Za-z0-9\-\_\.]+)([,\n\r}])/g, function(_,v,post){ // unquoted simple values -> quote them
+            if (/^[-]?\d+(\.\d+)?$/.test(v)) return ':' + v + post; // numbers keep
+            if (/^(true|false|null)$/i.test(v)) return ':' + v + post; // booleans/null keep
+            return ':' + JSON.stringify(v) + post;
+          })
+          .replace(/,(\s*[}\]])/g, "$1"); // remove trailing commas
+        return JSON.parse(safe);
+      } catch (e2) {
+        // give up
+        return null;
+      }
+    }
+  }
+
+  // 3) fallback: try to extract a {...} with regex greedy (less safe)
   const jmatch = txt.match(/\{[\s\S]*\}/);
   if (!jmatch) return null;
-  const raw = jmatch[0];
   try {
-    return JSON.parse(raw);
+    return JSON.parse(jmatch[0]);
   } catch (e) {
-    try {
-      const safe = raw
-        .replace(/([{,]\s*)([A-Za-z0-9_]+)\s*:/g, '$1"$2":') // quote keys
-        .replace(/(['`])([^'`]*?)\1/g, function(_,qd,inner){ return JSON.stringify(inner); }) // turn quoted values to JSON string form
-        .replace(/'/g, '"') // single -> double quotes
-        .replace(/,(\s*[}\]])/g, "$1"); // remove trailing commas
-      return JSON.parse(safe);
-    } catch (e2) {
-      return null;
-    }
+    return null;
   }
 }
 
 // ----------------- Build strict prompt -----------------
 function buildStrictPrompt(message) {
+  // sanitize triple quotes in message to avoid prompt breakage
+  const safeMessage = String(message).replace(/```/g, '``` ').replace(/\r/g, '\n');
   return `
 You are a logistics parser. Extract the following fields EXACTLY and return ONLY a single JSON object and NOTHING ELSE. Do NOT add any commentary.
 
@@ -73,7 +90,7 @@ Requirements:
 - If the message contains phrases like "new truck", "new gadi", etc., and there's no plate, leave truckNumber as "" unless that phrase is explicitly the value you want returned.
 
 Message:
-"""${String(message).replace(/```/g, "")}"""
+"""${safeMessage}"""
 `.trim();
 }
 
@@ -85,20 +102,36 @@ async function singleAiCall(prompt) {
   }
 
   try {
-    const resp = await openai.chat.completions.create({
-      model: MODEL_NAME,
-      messages: [{ role: "user", content: prompt }],
-      max_tokens: 600,
-      temperature: 0
-    });
+    // Use chat completions shape; support SDKs that use openai.chat.completions.create or client.responses
+    // The OpenAI node SDK has multiple shapes; attempt the chat.completions path first.
+    if (typeof openai.chat?.completions?.create === 'function') {
+      const resp = await openai.chat.completions.create({
+        model: MODEL_NAME,
+        messages: [{ role: "user", content: prompt }],
+        max_tokens: 600,
+        temperature: 0
+      });
+      const choice = resp?.choices?.[0];
+      const content = choice?.message?.content || choice?.text || "";
+      return String(content || "");
+    }
 
-    // Support SDK shapes: find text in response
-    const choice = resp?.choices?.[0];
-    if (!choice) return "";
+    // fallback for newer SDK that exposes 'responses.create'
+    if (typeof openai.responses?.create === 'function') {
+      const resp = await openai.responses.create({
+        model: MODEL_NAME,
+        input: prompt,
+        max_output_tokens: 600,
+        temperature: 0
+      });
+      // try multiple locations for text content
+      const text = (resp.output && Array.isArray(resp.output) && resp.output.map(o=>o.content?.map(c=>c.text).join('') || '').join('')) || resp.output_text || '';
+      return String(text || '');
+    }
 
-    // Prefer `message.content` then `text`
-    const content = choice.message?.content || choice.text || "";
-    return content;
+    // unknown SDK shape
+    console.warn("[lrExtractor] openai SDK shape unrecognized; skipping AI call.");
+    return "";
   } catch (err) {
     console.error("[lrExtractor] AI call error:", err && err.message ? err.message : String(err));
     return "";
@@ -141,7 +174,7 @@ async function extractDetails(message) {
   }
 
   // Could not parse JSON -> return empty schema (no fallback)
-  console.warn("[lrExtractor] Could not parse JSON from AI output -> returning empty fields.");
+  console.warn("[lrExtractor] Could not parse JSON from AI output -> returning empty fields. Raw AI text:", aiText.slice(0,1000));
   return { truckNumber: "", from: "", to: "", weight: "", description: "", name: "" };
 }
 
