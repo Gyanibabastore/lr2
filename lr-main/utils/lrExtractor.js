@@ -61,7 +61,7 @@ async function extractDetails(message) {
     return { truckNumber: "", from: "", to: "", weight: "", description: "", name: "" };
   }
 
-  const prompt = `
+ const prompt = `
 You are a smart logistics parser.
 
 Extract the following mandatory details from this message:
@@ -82,18 +82,22 @@ then set truckNumber to that phrase (exactly as it appears).
 If the weight contains the word "fix" or similar, preserve it as-is.
 
 Here is the message:
-"""${String(message).replace(/```/g, "")}"""
+"${message}"
 
-Return the extracted information strictly in the following JSON format (exactly one JSON object, no additional commentary):
+Return the extracted information strictly in the following JSON format:
 
 {
-  "truckNumber": "",
-  "from": "",
-  "to": "",
-  "weight": "",
-  "description": "",
-  "name": ""
+  "truckNumber": "",    // mandatory
+  "from": "",           // optional
+  "to": "",             // mandatory
+  "weight": "",         // mandatory
+  "description": "",    // mandatory
+  "name": ""            // optional
 }
+
+If any field is missing, return it as an empty string.
+
+Ensure the output is only the raw JSON — no extra text, notes, or formatting outside the JSON structure.
 `;
 
   try {
