@@ -1,11 +1,6 @@
 // utils/lrExtractor.js
-// LR extractor using ONLY the model (retries up to 3 times).
-// Exports: extractDetails(message) and isStructuredLR(message)
-//
-// Behavior:
-// - Tries to get a strict JSON from model up to 3 attempts.
-// - Uses deterministic sampling (temperature: 0) when model supports it.
-// - If model never returns valid JSON, returns empty fields (no local fallback).
+// LR extractor (single-call by default). Retries controlled by LR_RETRIES env var.
+// Uses model specified in LR_MODEL (default gpt-4o). No local fallback — returns empty fields if model fails.
 
 'use strict';
 try { require('dotenv').config(); } catch (e) { /* ignore */ }
@@ -23,21 +18,19 @@ if (API_KEY) {
   catch (e) { console.warn("[lrExtractor] Failed to create OpenAI client:", e && e.message ? e.message : e); }
 }
 
-// Default model: use gpt-4o (supports temperature). Override with LR_MODEL env var.
+// Default model (override via LR_MODEL)
 const MODEL_NAME = process.env.LR_MODEL || "gpt-4o";
+// Number of attempts (default 1). Set LR_RETRIES env var to >1 to enable retries.
+const LR_RETRIES = Number(process.env.LR_RETRIES || 1);
 
-// Heuristic: models with gpt-5 / o3 / reasoning often disallow sampling params
 const supportsSampling = !(/gpt-5|o3|reasoning|reasoner/i.test(MODEL_NAME));
-
-// Safe helpers
 const safeString = v => (v === undefined || v === null) ? "" : String(v).trim();
 const maskKey = k => { if(!k) return '<missing>'; const s=String(k); return s.length<=12? s : s.slice(0,6)+'...'+s.slice(-4); };
-if (API_KEY) console.log("[lrExtractor] API key preview:", maskKey(API_KEY), " Model:", MODEL_NAME);
+if (API_KEY) console.log("[lrExtractor] API key preview:", maskKey(API_KEY), " Model:", MODEL_NAME, "Retries:", LR_RETRIES);
 
 // ---------------- prompt builder (user's exact requirements embedded) ----------------
 function buildStrictPrompt(message) {
   const safeMessage = String(message || "").replace(/"/g, '\\"').replace(/\r/g, '\n');
-  // Base prompt (user-specified). We will also add "Attempt #n" NOTE outside when retrying.
   return `
 You are a smart logistics parser.
 
@@ -86,7 +79,6 @@ function tryParseJsonFromText(text) {
     const j = JSON.parse(txt);
     if (j && typeof j === 'object') return j;
   } catch (e) {
-    // try to extract first {...} block
     const first = txt.indexOf('{'), last = txt.lastIndexOf('}');
     if (first >= 0 && last > first) {
       const sub = txt.slice(first, last + 1);
@@ -107,38 +99,24 @@ function normalizeTruckNumber(raw) {
 }
 
 // ---------------- single AI request (handles both SDK shapes) ----------------
-async function modelCall(prompt, attempt = 1) {
+async function modelCall(prompt) {
   if (!API_KEY || !openai) {
     console.warn("[lrExtractor] No API key/client available: skipping AI call.");
     return "";
   }
-
   try {
-    // chat completions older shape
     if (typeof openai.chat?.completions?.create === 'function') {
-      const params = {
-        model: MODEL_NAME,
-        messages: [{ role: "user", content: prompt }],
-        max_completion_tokens: 600
-      };
+      const params = { model: MODEL_NAME, messages: [{ role: "user", content: prompt }], max_completion_tokens: 600 };
       if (supportsSampling) params.temperature = 0;
       const resp = await openai.chat.completions.create(params);
       const choice = resp?.choices?.[0];
-      const content = choice?.message?.content || choice?.text || choice?.delta?.content || "";
-      return String(content || "");
+      return String(choice?.message?.content || choice?.text || choice?.delta?.content || "" || "");
     }
 
-    // responses.create newer shape
     if (typeof openai.responses?.create === 'function') {
-      const params = {
-        model: MODEL_NAME,
-        input: prompt,
-        max_output_tokens: 600
-      };
+      const params = { model: MODEL_NAME, input: prompt, max_output_tokens: 600 };
       if (supportsSampling) params.temperature = 0;
       const resp = await openai.responses.create(params);
-
-      // extract text robustly
       let text = '';
       if (resp.output && Array.isArray(resp.output)) {
         for (const item of resp.output) {
@@ -160,8 +138,7 @@ async function modelCall(prompt, attempt = 1) {
     console.warn("[lrExtractor] openai SDK shape unrecognized; skipping AI call.");
     return "";
   } catch (err) {
-    // log errors
-    console.error("[lrExtractor] AI call error (attempt):", attempt, err && err.message ? err.message : err);
+    console.error("[lrExtractor] AI call error:", err && err.message ? err.message : err);
     if (err && err.response && err.response.data) {
       try { console.error("[lrExtractor] AI error response data:", JSON.stringify(err.response.data)); } catch(e){}
     }
@@ -178,19 +155,22 @@ async function extractDetails(message) {
   let aiText = "";
   let parsed = null;
 
-  // Try up to 3 attempts. Each attempt we append a short note to be stricter.
-  for (let i=1; i<=3; i++) {
+  // Attempt loop — by default LR_RETRIES = 1 so only one call will happen.
+  for (let i=1; i<=Math.max(1, LR_RETRIES); i++) {
+    // On retries we add a short note requesting strict JSON (keeps model focused)
     const prompt = (i === 1) ? basePrompt : (basePrompt + `\n\nIMPORTANT (Attempt ${i}): If you failed to return JSON previously, return ONLY the JSON object now with no extra text.`);
-    aiText = await modelCall(prompt, i);
+
+    aiText = await modelCall(prompt);
 
     if (!aiText) {
       console.warn(`[lrExtractor] Model returned empty on attempt ${i}.`);
-      continue; // try next attempt
+      // If LR_RETRIES==1, loop ends and we return empty fields below.
+      continue;
     }
 
     parsed = tryParseJsonFromText(aiText);
     if (parsed && typeof parsed === 'object') {
-      // ensure all fields exist
+      // ensure all fields exist, normalize truck
       parsed.truckNumber = safeString(parsed.truckNumber || "");
       parsed.from = safeString(parsed.from || "");
       parsed.to = safeString(parsed.to || "");
@@ -198,18 +178,17 @@ async function extractDetails(message) {
       parsed.description = safeString(parsed.description || "");
       parsed.name = safeString(parsed.name || "");
 
-      // normalize truck
       parsed.truckNumber = normalizeTruckNumber(parsed.truckNumber);
       console.log("[lrExtractor] Parsed result (from model) on attempt", i, parsed);
-      return parsed;
+      return parsed; // RETURN IMMEDIATELY — no more calls
     } else {
       console.warn(`[lrExtractor] Model returned unparsable/non-JSON on attempt ${i}. Raw:`, String(aiText).slice(0,1000));
-      // continue to next attempt
+      // continue only if LR_RETRIES > 1
     }
   }
 
-  // After 3 attempts: give up and return empty fields (no local extraction)
-  console.warn("[lrExtractor] All attempts exhausted — returning empty fields (no local fallback).");
+  // After attempts exhausted, return empty fields (no local fallback per user's request)
+  console.warn("[lrExtractor] Attempts exhausted — returning empty fields (no local fallback).");
   return { truckNumber: "", from: "", to: "", weight: "", description: "", name: "" };
 }
 
