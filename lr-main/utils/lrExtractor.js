@@ -1,10 +1,10 @@
 // utils/lrExtractor.js
-// AI-first LR extractor (uses GoogleGenerativeAI with an in-file API key as requested).
+// AI-first LR extractor (uses GoogleGenerativeAI with an in-file API key).
 // Exports: extractDetails(message) and isStructuredLR(message)
 
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 
-// --- NOTE: using the literal API key you provided (per your request) ---
+// --- Inline API key as requested ---
 const API_KEY = "AIzaSyBTt-wdj0YsByntwscggZ0dDRzrc7Qmc7I";
 const MODEL_NAME = "models/gemini-2.0-flash";
 
@@ -26,11 +26,7 @@ const capitalize = (str) => {
     .join(" ");
 };
 
-/* Robust JSON extraction from potentially messy AI output.
-   Tries:
-   1) find first {...} and JSON.parse
-   2) forgiving fixes: quote keys, remove trailing commas, replace single quotes
-*/
+// Try to extract a JSON object from messy text and parse it (forgiving fixes)
 function tryParseJsonFromText(text) {
   if (!text) return null;
   const txt = String(text).trim();
@@ -40,19 +36,33 @@ function tryParseJsonFromText(text) {
   try {
     return JSON.parse(raw);
   } catch (e) {
-    // forgiving cleanup
     try {
       let safe = raw
-        // ensure keys are quoted: foo: -> "foo":
-        .replace(/([{,]\s*)([A-Za-z0-9_]+)\s*:/g, '$1"$2":')
-        // replace single quotes with double quotes
-        .replace(/'/g, '"')
-        // remove trailing commas before } or ]
-        .replace(/,(\s*[}\]])/g, "$1");
+        .replace(/([{,]\s*)([A-Za-z0-9_]+)\s*:/g, '$1"$2":') // quote keys
+        .replace(/'/g, '"') // single -> double quotes
+        .replace(/,(\s*[}\]])/g, "$1"); // remove trailing commas
       return JSON.parse(safe);
     } catch (e2) {
       return null;
     }
+  }
+}
+
+// Low-level call to the AI model (returns text)
+async function aiCall(prompt, opts = {}) {
+  try {
+    const model = genAI.getGenerativeModel ? genAI.getGenerativeModel({ model: MODEL_NAME }) : null;
+    if (model && typeof model.generateContent === "function") {
+      const result = await model.generateContent(prompt, { temperature: 0, maxOutputTokens: 512, ...opts });
+      return result?.response?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    }
+    if (typeof genAI.generate === "function") {
+      const resp = await genAI.generate({ prompt, temperature: 0, maxOutputTokens: 512, ...opts });
+      return resp?.text || "";
+    }
+    return "";
+  } catch (e) {
+    return "";
   }
 }
 
@@ -61,12 +71,13 @@ async function extractDetails(message) {
     return { truckNumber: "", from: "", to: "", weight: "", description: "", name: "" };
   }
 
- const prompt = `
+  // Primary prompt (explicit, includes example)
+  const primaryPrompt = `
 You are a smart logistics parser.
 
 Extract the following mandatory details from this message:
 
-- truckNumber (which may be 9 or 10 characters long, possibly containing spaces or hyphens) 
+- truckNumber (which may be 9 or 10 characters long, possibly containing spaces or hyphens)
   Example: "MH 09 HH 4512" should be returned as "MH09HH4512"
 - to
 - weight
@@ -76,45 +87,46 @@ Also, extract the optional fields:
 - from (this is optional but often present)
 - name (if the message contains a pattern like "n - name", "n-name", " n name", " n. name", or any variation where 'n' is followed by '-' or '.' or space, and then the person's name — extract the text after it as the name value)
 
-If truckNumber is missing, but the message contains words like "brllgada","bellgade","bellgad","bellgadi","new truck", "new tractor", or "new gadi", 
-then set truckNumber to that phrase (exactly as it appears).
+If truckNumber is missing, but the message contains words like "brllgada","bellgade","bellgad","bellgadi","new truck", "new tractor", or "new gadi", then set truckNumber to that phrase (exactly as it appears).
 
 If the weight contains the word "fix" or similar, preserve it as-is.
 
 Here is the message:
-"${message}"
+"""${String(message).replace(/```/g, "")}"""
 
-Return the extracted information strictly in the following JSON format:
+Return the extracted information strictly in the following JSON format (ONLY the JSON object — no explanations, no bullet points, no extra text):
 
 {
-  "truckNumber": "",    // mandatory
-  "from": "",           // optional
-  "to": "",             // mandatory
-  "weight": "",         // mandatory
-  "description": "",    // mandatory
-  "name": ""            // optional
+  "truckNumber": "",
+  "from": "",
+  "to": "",
+  "weight": "",
+  "description": "",
+  "name": ""
 }
 
 If any field is missing, return it as an empty string.
-
-Ensure the output is only the raw JSON — no extra text, notes, or formatting outside the JSON structure.
 `;
 
-  try {
-    const model = genAI.getGenerativeModel({ model: MODEL_NAME });
-    const result = await model.generateContent(prompt);
-    const aiText =
-      result?.response?.candidates?.[0]?.content?.parts?.[0]?.text ||
-      result?.response?.candidates?.[0]?.content?.parts?.[0]?.markdown ||
-      "";
+  // Strict fallback prompt (even more forceful)
+  const strictPrompt = `
+STRICT: Reply ONLY with a single JSON object (no code fences, no commentary).
+Keys: "truckNumber","from","to","weight","description","name"
+If a field not found, set it to "".
 
+Message:
+"""${String(message).replace(/```/g, "")}"""
+`;
+
+  // Try attempts (primary -> strict). Parse forgivingly.
+  const attempts = [primaryPrompt, strictPrompt];
+  for (let i = 0; i < attempts.length; i++) {
+    const aiText = await aiCall(attempts[i]);
+    if (!aiText) continue;
     const parsed = tryParseJsonFromText(aiText);
-    if (!parsed || typeof parsed !== "object") {
-      // If parse failed, return empty-safe object (AI only mode per request)
-      return { truckNumber: "", from: "", to: "", weight: "", description: "", name: "" };
-    }
+    if (!parsed || typeof parsed !== "object") continue;
 
-    // Normalize and preserve expected fields
+    // Build normalized output
     let extracted = {
       truckNumber: parsed.truckNumber ? String(parsed.truckNumber).trim() : "",
       from: parsed.from ? String(parsed.from).trim() : "",
@@ -124,7 +136,7 @@ Ensure the output is only the raw JSON — no extra text, notes, or formatting o
       name: parsed.name ? String(parsed.name).trim() : "",
     };
 
-    // If truckNumber is one of special phrases keep as-is, else normalize plate style
+    // Normalize truck plate unless it's a special phrase
     if (
       extracted.truckNumber &&
       !["new truck", "new tractor", "new gadi", "bellgadi", "bellgada", "bellgade", "bellgad", "brllgada"].includes(
@@ -133,45 +145,42 @@ Ensure the output is only the raw JSON — no extra text, notes, or formatting o
     ) {
       extracted.truckNumber = normalizeTruck(extracted.truckNumber);
     } else if (extracted.truckNumber) {
-      // keep casing as original phrase (but normalize spacing)
       extracted.truckNumber = String(extracted.truckNumber).trim();
     }
 
-    // Capitalize textual fields
+    // Capitalize words
     if (extracted.from) extracted.from = capitalize(extracted.from);
     if (extracted.to) extracted.to = capitalize(extracted.to);
     if (extracted.description) extracted.description = capitalize(extracted.description);
     if (extracted.name) extracted.name = capitalize(extracted.name);
 
-    // Weight handling: preserve "fix" words otherwise normalize numeric units
+    // Weight handling: preserve 'fix' else normalize numeric
     if (extracted.weight) {
       if (/fix/i.test(extracted.weight)) {
         extracted.weight = extracted.weight.trim();
       } else {
-        const num = parseFloat(String(extracted.weight).replace(/,/g, ""));
-        if (!isNaN(num)) {
-          if (num > 0 && num < 100) extracted.weight = Math.round(num * 1000).toString();
-          else extracted.weight = Math.round(num).toString();
+        const n = parseFloat(String(extracted.weight).replace(/,/g, ""));
+        if (!isNaN(n)) {
+          if (n > 0 && n < 100) extracted.weight = Math.round(n * 1000).toString();
+          else extracted.weight = Math.round(n).toString();
         } else {
-          // keep as-is if not numeric
           extracted.weight = extracted.weight.trim();
         }
       }
     }
 
-    // Ensure shape
     return {
       truckNumber: extracted.truckNumber || "",
       from: extracted.from || "",
       to: extracted.to || "",
       weight: extracted.weight || "",
       description: extracted.description || "",
-      name: extracted.name || "",
+      name: extracted.name || ""
     };
-  } catch (e) {
-    // On any error, return empty shape (AI-only mode mandated)
-    return { truckNumber: "", from: "", to: "", weight: "", description: "", name: "" };
   }
+
+  // If AI fails both attempts, return empty shape (AI-only policy)
+  return { truckNumber: "", from: "", to: "", weight: "", description: "", name: "" };
 }
 
 async function isStructuredLR(message) {
