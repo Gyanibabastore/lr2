@@ -83,6 +83,13 @@ function saveSubadmins() {
   fs.writeFileSync(subadminPath, JSON.stringify(subadminNumbers, null, 2));
   updateAllNumbers();
 }
+// ---------- runtime state ----------
+let sentNumbers = [];
+let currentTemplate = 1;             // Default template rakho
+let awaitingTemplateSelection = false;
+let awaitingHelpSelection = false;
+let awaitingMonthSelection = false;
+// -----------------------------------
 
 /* ------------------- WhatsApp send helper (normalize + log) ------------------- */
 async function sendWhatsAppMessage(to, text) {
