@@ -1,6 +1,10 @@
 // utils/lrExtractor.js
 // OpenAI-based LR extractor that mirrors the Gemini behaviour & post-processing you provided.
-// Behavior: RELY ONLY on model's JSON output for fields. No local inference of 'from' from message.
+// Behavior: RELY on model for most fields but:
+//  - If message contains origin-destination patterns (e.g., "Indore to Nagpur", "Indore se Nagpur", "Indore - Nagpur"),
+//    place the first part into `from` and the second into `to` (if model didn't already provide `from`).
+//  - Do NOT use model's `description`. Instead extract description only from the provided goodsKeywords list
+//    (first match(es) in message). If none matched, description remains empty.
 // Added: verbose console logging of raw model response + cleaned text + parsing result.
 // Exports: extractDetails(message) and isStructuredLR(message)
 
@@ -29,6 +33,22 @@ const supportsSampling = !(/gpt-5|o3|reasoning|reasoner/i.test(MODEL_NAME));
 const safeString = v => (v === undefined || v === null) ? "" : String(v).trim();
 const maskKey = k => { if(!k) return '<missing>'; const s=String(k); return s.length<=12? s : s.slice(0,6)+'...'+s.slice(-4); };
 if (API_KEY) console.log("[lrExtractor] API key preview:", maskKey(API_KEY), " Model:", MODEL_NAME, "Retries:", LR_RETRIES);
+
+// ---------------- goods keywords (use exactly these for description extraction) ----------------
+const goodsKeywords = [
+  'aluminium section','angel channel','battery scrap','finish goods','paper scrap','shutter material',
+  'iron scrap','metal scrap','ms plates','ms scrap','machine scrap','plastic dana','plastic scrap',
+  'rubber scrap','pushta scrap','rolling scrap','tmt bar','tarafa','metal screp','plastic screp',
+  'plastic scrp','plastic secrap','raddi scrap','pusta scrap','allminium scrap',
+  'ajwain','ajvain','aluminium','alluminium','allumium','alluminum','aluminum','angel','angal',
+  'battery','battrey','cement','siment','chaddar','chadar','chader','churi','chhuri','choori',
+  'coil','sheet','sheets','drum','dram','drums','finish','fenish','paper','shutter','shuttar',
+  'haldi','haaldi','oil','taraba','tarafe','tarama','tarana','tarapa','tarfa','trafa','machine',
+  'pipe','pip','plastic','pilastic','pladtic','plastec','plastick','plastics','plastik','rubber',
+  'rubar','rabar','ruber','pusta','steel','isteel','steels','stel','sugar','tubes','tyre','tayar',
+  'tyer','scrap','screp','dana','pushta','rolling','tmt','bar','loha','pusta','tilli','tili',
+  'finishu','finisih','finis','finnish','finsh','finush','fnish','funish','plates','plate','iron','iran',
+];
 
 // ---------------- Build the prompt (your Gemini prompt verbatim) ----------------
 function buildStrictPrompt(message) {
@@ -153,7 +173,9 @@ function tryParseJsonFromText(text) {
 function normalizeTruckNumber(raw) {
   if (!raw) return "";
   let s = String(raw).trim();
-  // Strip spaces/dots/hyphens and uppercase
+  const lower = s.toLowerCase();
+  const specials = ["new truck","new tractor","new gadi","bellgadi","bellgada","bellgade","bellgad"];
+  for (const p of specials) if (lower.includes(p)) return p;
   return s.replace(/[\s\.\-]/g, '').toUpperCase();
 }
 
@@ -198,6 +220,48 @@ async function modelCall(prompt) {
   }
 }
 
+// ---------------- find goods keywords in message (returns array in order found) ----------------
+function findGoodsInMessage(message) {
+  if (!message) return [];
+  const lower = message.toLowerCase();
+  const found = [];
+  for (const kw of goodsKeywords) {
+    // build a safe regex: escape special chars in kw
+    const esc = kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp('\\b' + esc + '\\b', 'i');
+    if (re.test(lower) && !found.includes(kw)) {
+      found.push(kw);
+    }
+  }
+  return found;
+}
+
+// ---------------- origin-destination detection from raw message ----------------
+function detectOriginDestinationFromMessage(message) {
+  if (!message) return null;
+  const m = String(message).trim();
+  // common separators: " to ", " se ", "-", "–", "—", "->"
+  // try to find the FIRST occurrence of these patterns where left and right are words
+  const odRegexes = [
+    /([A-Za-z0-9\u00C0-\u017F &\.\']{2,}?)\s+(?:to)\s+([A-Za-z0-9\u00C0-\u017F &\.\']{2,})/i,
+    /([A-Za-z0-9\u00C0-\u017F &\.\']{2,}?)\s+(?:se)\s+([A-Za-z0-9\u00C0-\u017F &\.\']{2,})/i,
+    /([A-Za-z0-9\u00C0-\u017F &\.\']{2,}?)\s*[-–—]+\s*([A-Za-z0-9\u00C0-\u017F &\.\']{2,})/i,
+    /([A-Za-z0-9\u00C0-\u017F &\.\']{2,}?)\s*->\s*([A-Za-z0-9\u00C0-\u017F &\.\']{2,})/i
+  ];
+  for (const rx of odRegexes) {
+    const match = m.match(rx);
+    if (match && match[1] && match[2]) {
+      let origin = match[1].trim();
+      let dest = match[2].trim();
+      // remove trailing punctuation
+      origin = origin.replace(/^[\:\-]+|[\:\-]+$/g,'').trim();
+      dest = dest.replace(/^[\:\-]+|[\:\-]+$/g,'').trim();
+      return { origin, dest };
+    }
+  }
+  return null;
+}
+
 // ---------------- Public API: extractDetails ----------------
 async function extractDetails(message) {
   console.log("[lrExtractor] extractDetails called. Snippet:", String(message||'').slice(0,300).replace(/\n/g,' | '));
@@ -229,23 +293,58 @@ async function extractDetails(message) {
     parsed = tryParseJsonFromText(cleaned);
 
     if (parsed && typeof parsed === 'object') {
-      // IMPORTANT: RELY ONLY on model's returned fields (no local-from inference).
-      // bring to shape & minimal post-process (normalization/capitalization/weight formatting only)
+      // RELY on model for most fields but override description from message goodsKeywords
       parsed.truckNumber = safeString(parsed.truckNumber || "");
-      parsed.from = safeString(parsed.from || "");        // do NOT infer from message
+      parsed.from = safeString(parsed.from || "");
       parsed.to = safeString(parsed.to || "");
       parsed.weight = safeString(parsed.weight || "");
-      parsed.description = safeString(parsed.description || "");
+      // DO NOT use parsed.description from model - replace based on goodsKeywords in message.
+      parsed.description = "";
       parsed.name = safeString(parsed.name || "");
 
-      // Normalize truckNumber formatting (strip separators, uppercase) if present
-      if (parsed.truckNumber) parsed.truckNumber = normalizeTruckNumber(parsed.truckNumber);
+      // If truckNumber empty, check message for special phrases
+      if (!parsed.truckNumber) {
+        const lowerMsg = String(message).toLowerCase();
+        if (lowerMsg.includes("new truck")) parsed.truckNumber = "new truck";
+        else if (lowerMsg.includes("new tractor")) parsed.truckNumber = "new tractor";
+        else if (lowerMsg.includes("new gadi")) parsed.truckNumber = "new gadi";
+        else if (lowerMsg.includes("bellgadi")) parsed.truckNumber = "bellgadi";
+        else if (lowerMsg.includes("bellgada")) parsed.truckNumber = "bellgada";
+        else if (lowerMsg.includes("bellgade")) parsed.truckNumber = "bellgade";
+        else if (lowerMsg.includes("bellgad")) parsed.truckNumber = "bellgad";
+      }
+
+      // Normalize truckNumber if not special phrase
+      const lowerTruck = String(parsed.truckNumber || "").toLowerCase();
+      if (parsed.truckNumber && !["new truck","new tractor","new gadi","bellgadi","bellgada","bellgade","bellgad"].includes(lowerTruck)) {
+        parsed.truckNumber = parsed.truckNumber.replace(/[\s\.\-]/g, '').toUpperCase();
+      }
+
+      // ===== NEW: If parsed.from empty, try to detect origin-destination from raw message (e.g., "Manavar to Indore") =====
+      if ((!parsed.from || parsed.from.trim() === "") ) {
+        const od = detectOriginDestinationFromMessage(message);
+        if (od) {
+          parsed.from = od.origin;
+          parsed.to = od.dest || parsed.to;
+          console.log(`[lrExtractor] Local OD detection from message -> from='${parsed.from}', to='${parsed.to}'`);
+        }
+      }
 
       // Capitalize fields (cosmetic)
       if (parsed.from) parsed.from = capitalize(parsed.from);
       if (parsed.to) parsed.to = capitalize(parsed.to);
-      if (parsed.description) parsed.description = capitalize(parsed.description);
-      if (parsed.name) parsed.name = capitalize(parsed.name);
+
+      // ===== NEW: Extract description ONLY from goodsKeywords present in message (do NOT use model's description) =====
+      const foundGoods = findGoodsInMessage(message);
+      if (foundGoods && foundGoods.length > 0) {
+        // join unique found goods (preserve order) and capitalize each
+        const uniqueGoods = [...new Set(foundGoods)];
+        parsed.description = uniqueGoods.map(g => capitalize(g)).join(', ');
+        console.log(`[lrExtractor] Description set from message goods keywords: ${parsed.description}`);
+      } else {
+        parsed.description = ""; // explicit: no description if goods keywords not found
+        console.log(`[lrExtractor] No goods keywords found in message -> description left empty.`);
+      }
 
       // Weight handling (mirror Gemini behavior): keep 'fix' etc; else parse numeric and convert
       if (parsed.weight) {
@@ -270,13 +369,16 @@ async function extractDetails(message) {
         }
       }
 
-      console.log("[lrExtractor] Parsed result (from model) on attempt", i, parsed);
+      // Name capitalization
+      if (parsed.name) parsed.name = capitalize(parsed.name);
+
+      console.log("[lrExtractor] Parsed result (from model + local overrides) on attempt", i, parsed);
 
       // LOG if mandatory fields missing in model output — for visibility
       if (!parsed.truckNumber) console.warn("[lrExtractor] NOTE: model did not return truckNumber.");
       if (!parsed.to) console.warn("[lrExtractor] NOTE: model did not return 'to'.");
       if (!parsed.weight) console.warn("[lrExtractor] NOTE: model did not return 'weight'.");
-      if (!parsed.description) console.warn("[lrExtractor] NOTE: model did not return 'description'.");
+      if (!parsed.description) console.warn("[lrExtractor] NOTE: description empty (no goods keywords found in message).");
 
       return parsed;
     } else {
