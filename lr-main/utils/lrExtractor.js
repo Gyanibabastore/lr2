@@ -1,5 +1,6 @@
 // utils/lrExtractor.js
 // OpenAI-based LR extractor that mirrors the Gemini behaviour & post-processing you provided.
+// Behavior: RELY ONLY on model's JSON output for fields. No local inference of 'from' from message.
 // Added: verbose console logging of raw model response + cleaned text + parsing result.
 // Exports: extractDetails(message) and isStructuredLR(message)
 
@@ -152,9 +153,7 @@ function tryParseJsonFromText(text) {
 function normalizeTruckNumber(raw) {
   if (!raw) return "";
   let s = String(raw).trim();
-  const lower = s.toLowerCase();
-  const specials = ["new truck","new tractor","new gadi","bellgadi","bellgada","bellgade","bellgad"];
-  for (const p of specials) if (lower.includes(p)) return p;
+  // Strip spaces/dots/hyphens and uppercase
   return s.replace(/[\s\.\-]/g, '').toUpperCase();
 }
 
@@ -230,77 +229,25 @@ async function extractDetails(message) {
     parsed = tryParseJsonFromText(cleaned);
 
     if (parsed && typeof parsed === 'object') {
-      // bring to shape & post-process (match your Gemini code)
-      // ensure fields exist
+      // IMPORTANT: RELY ONLY on model's returned fields (no local-from inference).
+      // bring to shape & minimal post-process (normalization/capitalization/weight formatting only)
       parsed.truckNumber = safeString(parsed.truckNumber || "");
-      parsed.from = safeString(parsed.from || "");
+      parsed.from = safeString(parsed.from || "");        // do NOT infer from message
       parsed.to = safeString(parsed.to || "");
       parsed.weight = safeString(parsed.weight || "");
       parsed.description = safeString(parsed.description || "");
       parsed.name = safeString(parsed.name || "");
 
-      // If truckNumber empty, check message for special phrases
-      if (!parsed.truckNumber) {
-        const lowerMsg = String(message).toLowerCase();
-        if (lowerMsg.includes("new truck")) parsed.truckNumber = "new truck";
-        else if (lowerMsg.includes("new tractor")) parsed.truckNumber = "new tractor";
-        else if (lowerMsg.includes("new gadi")) parsed.truckNumber = "new gadi";
-        else if (lowerMsg.includes("bellgadi")) parsed.truckNumber = "bellgadi";
-        else if (lowerMsg.includes("bellgada")) parsed.truckNumber = "bellgada";
-        else if (lowerMsg.includes("bellgade")) parsed.truckNumber = "bellgade";
-        else if (lowerMsg.includes("bellgad")) parsed.truckNumber = "bellgad";
-      }
+      // Normalize truckNumber formatting (strip separators, uppercase) if present
+      if (parsed.truckNumber) parsed.truckNumber = normalizeTruckNumber(parsed.truckNumber);
 
-      // Normalize truckNumber if not special phrase
-      const lowerTruck = String(parsed.truckNumber || "").toLowerCase();
-      if (parsed.truckNumber && !["new truck","new tractor","new gadi","bellgadi","bellgada","bellgade","bellgad"].includes(lowerTruck)) {
-        parsed.truckNumber = parsed.truckNumber.replace(/[\s\.\-]/g, '').toUpperCase();
-      }
-
-      // ---------- ADDED: Local deterministic regex on original message to extract origin/destination ----------
-      // Try to get from/to from original message first (handles cases where model missed 'from')
-      try {
-        const orig = String(message || "");
-        const msgMatch = orig.match(/([A-Za-z0-9\.\,\/\s&]{2,}?)\s*(?:-|–|—|\bto\b)\s*([A-Za-z0-9\.\,\/\s&]{2,})/i);
-        if (msgMatch) {
-          const msgOrigin = msgMatch[1].trim().replace(/^[\:\-]+|[\:\-]+$/g,'').trim();
-          const msgDest = msgMatch[2].trim().replace(/^[\:\-]+|[\:\-]+$/g,'').trim();
-          if (msgOrigin && !parsed.from) {
-            parsed.from = msgOrigin;
-            console.log(`[lrExtractor] Local regex found origin from message: '${parsed.from}'`);
-          }
-          if (msgDest && (!parsed.to || parsed.to.length < 3 || parsed.to.toLowerCase() === parsed.from.toLowerCase())) {
-            parsed.to = msgDest;
-            console.log(`[lrExtractor] Local regex found destination from message: '${parsed.to}'`);
-          }
-        }
-      } catch (e) {
-        console.warn('[lrExtractor] Local message regex failed:', e && e.message ? e.message : e);
-      }
-
-      // ===== NEW/FALLBACK: If from empty but to contains origin-destination pair, split parsed.to =====
-      if ((!parsed.from || parsed.from.trim() === "") && parsed.to) {
-        const td = parsed.to.trim();
-        let splitMatch = td.match(/^(.+?)[\s\-–—]+(.+)$/);
-        if (!splitMatch) splitMatch = td.match(/^(.+?)\s+to\s+(.+)$/i);
-        if (splitMatch) {
-          let origin = splitMatch[1].trim();
-          let dest = splitMatch[2].trim();
-          origin = origin.replace(/^[\:\-]+|[\:\-]+$/g,'').trim();
-          dest = dest.replace(/^[\:\-]+|[\:\-]+$/g,'').trim();
-          if (origin) parsed.from = origin;
-          if (dest) parsed.to = dest;
-          console.log(`[lrExtractor] Split 'to' into from='${parsed.from}' and to='${parsed.to}'`);
-        }
-      }
-
-      // Capitalize fields
+      // Capitalize fields (cosmetic)
       if (parsed.from) parsed.from = capitalize(parsed.from);
       if (parsed.to) parsed.to = capitalize(parsed.to);
       if (parsed.description) parsed.description = capitalize(parsed.description);
       if (parsed.name) parsed.name = capitalize(parsed.name);
 
-      // Weight handling (mirror Gemini)
+      // Weight handling (mirror Gemini behavior): keep 'fix' etc; else parse numeric and convert
       if (parsed.weight) {
         if (/fix/i.test(parsed.weight)) {
           parsed.weight = parsed.weight.trim();
@@ -324,6 +271,13 @@ async function extractDetails(message) {
       }
 
       console.log("[lrExtractor] Parsed result (from model) on attempt", i, parsed);
+
+      // LOG if mandatory fields missing in model output — for visibility
+      if (!parsed.truckNumber) console.warn("[lrExtractor] NOTE: model did not return truckNumber.");
+      if (!parsed.to) console.warn("[lrExtractor] NOTE: model did not return 'to'.");
+      if (!parsed.weight) console.warn("[lrExtractor] NOTE: model did not return 'weight'.");
+      if (!parsed.description) console.warn("[lrExtractor] NOTE: model did not return 'description'.");
+
       return parsed;
     } else {
       console.warn(`[lrExtractor] Model returned unparsable/non-JSON on attempt ${i}. Raw cleaned text shown above.`);
