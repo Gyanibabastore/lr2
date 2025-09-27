@@ -236,29 +236,70 @@ function findGoodsInMessage(message) {
   return found;
 }
 
-// ---------------- origin-destination detection from raw message ----------------
+// ---------------- origin-destination detection from raw message (safer) ----------------
 function detectOriginDestinationFromMessage(message) {
   if (!message) return null;
   const m = String(message).trim();
-  // common separators: " to ", " se ", "-", "–", "—", "->"
-  // try to find the FIRST occurrence of these patterns where left and right are words
+
+  // helper: decide if a text is likely a LOCATION (not weight/desc)
+  function isLikelyLocation(s) {
+    if (!s) return false;
+    const lower = s.toLowerCase();
+
+    // reject if contains explicit weight/unit tokens or phone-like patterns
+    if (/\b(kg|kgs|kilogram|kilograms|ton|tons|tonne|mt\b|mton|t\b|kgs\b|kg\b|gms?|gm\b)\b/i.test(lower)) return false;
+    if (/\b\d{3,}\b/.test(lower) && !/[a-zA-Z]/.test(lower)) return false; // pure long numbers -> not location
+    if (/\b\d{2,}[\s-]*kg\b/i.test(lower)) return false;
+
+    // reject if contains goods keywords (we treat those as description)
+    for (const kw of goodsKeywords) {
+      if (lower.includes(kw)) return false;
+    }
+
+    // phone number like
+    if (/\b\d{6,}\b/.test(lower) && /[a-zA-Z]/.test(lower) === false) return false;
+
+    // letters vs digits heuristic: need reasonable letters count
+    const letters = (s.match(/[a-zA-Z\u00C0-\u017F]/g) || []).length;
+    const digits = (s.match(/\d/g) || []).length;
+    if (letters < 3) return false; // too short or not enough letters -> likely not a place
+    // if digits dominate letters, probably not a location (e.g., "7300 kg")
+    if (digits > letters) return false;
+
+    return true;
+  }
+
+  // regex patterns to try (same as before, but we'll validate parts)
   const odRegexes = [
     /([A-Za-z0-9\u00C0-\u017F &\.\']{2,}?)\s+(?:to)\s+([A-Za-z0-9\u00C0-\u017F &\.\']{2,})/i,
     /([A-Za-z0-9\u00C0-\u017F &\.\']{2,}?)\s+(?:se)\s+([A-Za-z0-9\u00C0-\u017F &\.\']{2,})/i,
     /([A-Za-z0-9\u00C0-\u017F &\.\']{2,}?)\s*[-–—]+\s*([A-Za-z0-9\u00C0-\u017F &\.\']{2,})/i,
     /([A-Za-z0-9\u00C0-\u017F &\.\']{2,}?)\s*->\s*([A-Za-z0-9\u00C0-\u017F &\.\']{2,})/i
   ];
+
   for (const rx of odRegexes) {
     const match = m.match(rx);
     if (match && match[1] && match[2]) {
       let origin = match[1].trim();
       let dest = match[2].trim();
-      // remove trailing punctuation
+
+      // strip surrounding punctuation
       origin = origin.replace(/^[\:\-]+|[\:\-]+$/g,'').trim();
       dest = dest.replace(/^[\:\-]+|[\:\-]+$/g,'').trim();
-      return { origin, dest };
+
+      const originOk = isLikelyLocation(origin);
+      const destOk = isLikelyLocation(dest);
+
+      if (originOk && destOk) {
+        return { origin, dest };
+      } else {
+        // log rejection reason
+        console.log(`[lrExtractor] OD-detect rejected: originOk=${originOk}, destOk=${destOk}, origin='${origin}', dest='${dest}'`);
+        // continue to try other patterns
+      }
     }
   }
+
   return null;
 }
 
