@@ -1,3 +1,13 @@
+// utils/lrExtractor.js
+// OpenAI-based LR extractor that mirrors the Gemini behaviour & post-processing you provided.
+// Behavior: RELY on model for most fields but:
+//  - If message contains origin-destination patterns (e.g., "Indore to Nagpur", "Indore se Nagpur", "Indore - Nagpur"),
+//    place the first part into `from` and the second into `to` (if model didn't already provide `from`).
+//  - Do NOT use model's `description`. Instead extract description only from the provided goodsKeywords list
+//    (first match(es) in message). If none matched, description remains empty.
+// Added: verbose console logging of raw model response + cleaned text + parsing result.
+// Exports: extractDetails(message) and isStructuredLR(message)
+
 'use strict';
 try { require('dotenv').config(); } catch (e) { /* ignore */ }
 
@@ -46,7 +56,7 @@ function buildStrictPrompt(message) {
   return `
 You are a smart logistics parser.
 
-Extract the following mandatory details from this message:
+Extract the following *mandatory* details from this message:
 
 - truckNumber (which may be 9 or 10 characters long, possibly containing spaces or hyphens) 
   Example: "MH 09 HH 4512" should be returned as "MH09HH4512"
@@ -54,7 +64,7 @@ Extract the following mandatory details from this message:
 - weight
 - description
 
-Also, extract the optional fields:
+Also, extract the *optional* fields:
 - from (this is optional but often present)
 - name (if the message contains a pattern like "n - name", "n-name", " n name", " n. name", or any variation where 'n' is followed by '-' or '.' or space, and then the person's name — extract the text after it as the name value)
 
@@ -62,6 +72,8 @@ If truckNumber is missing, but the message contains words like "brllgada","bellg
 then set truckNumber to that phrase (exactly as it appears).
 
 If the weight contains the word "fix" or similar, preserve it as-is.
+
+Always treat the text before the word "to" as the 'from' location and the text after "to" as the 'to' location.
 
 Here is the message:
 "${safeMessage}"
@@ -125,10 +137,10 @@ function stripFormatting(text) {
   if (!text) return '';
   let t = String(text).trim();
   // remove triple backtick fences
-  t = t.replace(/^\s*[\w\s]*\n?/, '');
-  t = t.replace(/\n?\s*$/, '');
-  // remove json labels
-  t = t.replace(/json/g, '');
+  t = t.replace(/^\s*```[\w\s]*\n?/, '');
+  t = t.replace(/\n?```\s*$/, '');
+  // remove ```json labels
+  t = t.replace(/```json/g, '');
   // Try to keep only the JSON block if there is pre/post text
   const firstBrace = t.indexOf('{');
   const lastBrace = t.lastIndexOf('}');
@@ -283,9 +295,7 @@ function detectOriginDestinationFromMessage(message) {
       if (originOk && destOk) {
         return { origin, dest };
       } else {
-        // log rejection reason
-        
-        // continue to try other patterns
+        console.log(`[lrExtractor] OD-detect rejected: originOk=${originOk}, destOk=${destOk}, origin='${origin}', dest='${dest}'`);
       }
     }
   }
@@ -293,38 +303,9 @@ function detectOriginDestinationFromMessage(message) {
   return null;
 }
 
-// ---------------- local name extraction when model misses (n + at least 2 letters) ----------------
-function localNameExtraction(message) {
-  if (!message) return "";
-  const m = String(message);
-
-  // Patterns: n - Rahul, n. Rahul, n Rahul, n:Rahul, name: Rahul etc.
-  const patterns = [
-    /\bn[\s\-\.\:]+([A-Za-z]{2,}(?:\s+[A-Za-z]{1,})?)/i,
-    /\bname[\s\-\:\.]+([A-Za-z]{2,}(?:\s+[A-Za-z]{1,})?)/i,
-    /\bn\)\s*([A-Za-z]{2,})\b/i
-  ];
-
-  for (const rx of patterns) {
-    const g = m.match(rx);
-    if (g && g[1]) {
-      return g[1].trim();
-    }
-  }
-
-  // fallback: check lines starting with 'n '
-  const lines = m.split(/\r?\n/);
-  for (const ln of lines) {
-    const g = ln.trim().match(/^\bn[\s\-\.\:]+([A-Za-z]{2,})/i);
-    if (g && g[1]) return g[1].trim();
-  }
-
-  return "";
-}
-
 // ---------------- Public API: extractDetails ----------------
 async function extractDetails(message) {
-
+  console.log("[lrExtractor] extractDetails called. Snippet:", String(message||'').slice(0,300).replace(/\n/g,' | '));
   if (!message) return { truckNumber: "", from: "", to: "", weight: "", description: "", name: "" };
 
   const basePrompt = buildStrictPrompt(message);
@@ -332,37 +313,30 @@ async function extractDetails(message) {
   let parsed = null;
 
   for (let i=1; i<=Math.max(1, LR_RETRIES); i++) {
-    const prompt = (i === 1) ? basePrompt : (basePrompt + \n\nIMPORTANT (Attempt ${i}): If you failed to return JSON previously, return ONLY the JSON object now with no extra text.);
+    const prompt = (i === 1) ? basePrompt : (basePrompt + `\n\nIMPORTANT (Attempt ${i}): If you failed to return JSON previously, return ONLY the JSON object now with no extra text.`);
 
-    // ---- call model ----
     aiText = await modelCall(prompt);
 
-    // ---- LOG: raw model response ----
-
+    console.log(`\n[lrExtractor] Raw model response (attempt ${i}):\n${aiText}\n`);
 
     if (!aiText) {
-      console.warn([lrExtractor] Model returned empty on attempt ${i}.);
+      console.warn(`[lrExtractor] Model returned empty on attempt ${i}.`);
       continue;
     }
 
-    // ---- LOG: cleaned (stripped) text ----
     const cleaned = stripFormatting(aiText);
-    console.log([lrExtractor] Cleaned response (attempt ${i}):\n${cleaned}\n);
+    console.log(`[lrExtractor] Cleaned response (attempt ${i}):\n${cleaned}\n`);
 
-    // ---- try parse ----
     parsed = tryParseJsonFromText(cleaned);
 
     if (parsed && typeof parsed === 'object') {
-      // RELY on model for most fields but override description from message goodsKeywords
       parsed.truckNumber = safeString(parsed.truckNumber || "");
       parsed.from = safeString(parsed.from || "");
       parsed.to = safeString(parsed.to || "");
       parsed.weight = safeString(parsed.weight || "");
-      // DO NOT use parsed.description from model - replace based on goodsKeywords in message.
       parsed.description = "";
       parsed.name = safeString(parsed.name || "");
 
-      // If truckNumber empty, check message for special phrases
       if (!parsed.truckNumber) {
         const lowerMsg = String(message).toLowerCase();
         if (lowerMsg.includes("new truck")) parsed.truckNumber = "new truck";
@@ -374,39 +348,33 @@ async function extractDetails(message) {
         else if (lowerMsg.includes("bellgad")) parsed.truckNumber = "bellgad";
       }
 
-      // Normalize truckNumber if not special phrase
       const lowerTruck = String(parsed.truckNumber || "").toLowerCase();
       if (parsed.truckNumber && !["new truck","new tractor","new gadi","bellgadi","bellgada","bellgade","bellgad"].includes(lowerTruck)) {
         parsed.truckNumber = parsed.truckNumber.replace(/[\s\.\-]/g, '').toUpperCase();
       }
 
-      // ===== NEW: If parsed.from empty, try to detect origin-destination from raw message (e.g., "Manavar to Indore") =====
       if ((!parsed.from || parsed.from.trim() === "") ) {
         const od = detectOriginDestinationFromMessage(message);
         if (od) {
           parsed.from = od.origin;
           parsed.to = od.dest || parsed.to;
-
+          console.log(`[lrExtractor] Local OD detection from message -> from='${parsed.from}', to='${parsed.to}'`);
         }
       }
 
-      // Capitalize fields (cosmetic)
       if (parsed.from) parsed.from = capitalize(parsed.from);
       if (parsed.to) parsed.to = capitalize(parsed.to);
 
-      // ===== NEW: Extract description ONLY from goodsKeywords present in message (do NOT use model's description) =====
       const foundGoods = findGoodsInMessage(message);
       if (foundGoods && foundGoods.length > 0) {
-        // join unique found goods (preserve order) and capitalize each
         const uniqueGoods = [...new Set(foundGoods)];
         parsed.description = uniqueGoods.map(g => capitalize(g)).join(', ');
-        
+        console.log(`[lrExtractor] Description set from message goods keywords: ${parsed.description}`);
       } else {
-        parsed.description = ""; // explicit: no description if goods keywords not found
-
+        parsed.description = "";
+        console.log(`[lrExtractor] No goods keywords found in message -> description left empty.`);
       }
 
-      // Weight handling (mirror Gemini behavior): keep 'fix' etc; else parse numeric and convert
       if (parsed.weight) {
         if (/fix/i.test(parsed.weight)) {
           parsed.weight = parsed.weight.trim();
@@ -429,60 +397,22 @@ async function extractDetails(message) {
         }
       }
 
-      // Name capitalization
       if (parsed.name) parsed.name = capitalize(parsed.name);
 
-      // ===== NEW: If model didn't provide name, try local extraction (n + at least 2 letters) =====
-      if ((!parsed.name || parsed.name.trim() === "")) {
-        const localName = localNameExtraction(message);
-        if (localName) {
-          parsed.name = capitalize(localName);
-          console.log([lrExtractor] Name extracted locally from message -> '${parsed.name}');
-        }
-      }
+      console.log("[lrExtractor] Parsed result (from model + local overrides) on attempt", i, parsed);
 
-
-
-      // LOG if mandatory fields missing in model output — for visibility
       if (!parsed.truckNumber) console.warn("[lrExtractor] NOTE: model did not return truckNumber.");
       if (!parsed.to) console.warn("[lrExtractor] NOTE: model did not return 'to'.");
       if (!parsed.weight) console.warn("[lrExtractor] NOTE: model did not return 'weight'.");
       if (!parsed.description) console.warn("[lrExtractor] NOTE: description empty (no goods keywords found in message).");
 
-      // ---- NEW: Print both parsed JSON (ChatGPT result) AND Excel-like row object for easy copy/paste ----
-      try {
-        // ChatGPT parsed JSON
-       
-        // Excel row object (columns: truckNumber, from, to, weight, description, name, rawMessageSnippet)
-        const excelRow = {
-          truckNumber: parsed.truckNumber || "",
-          from: parsed.from || "",
-          to: parsed.to || "",
-          weight: parsed.weight || "",
-          description: parsed.description || "",
-          name: parsed.name || "",
-          rawMessageSnippet: String(message || "").slice(0,200)
-        };
-
-      } catch (e) {
-        console.warn("[lrExtractor] Failed to print outputs:", e && e.message ? e.message : e);
-      }
-
       return parsed;
     } else {
-      console.warn([lrExtractor] Model returned unparsable/non-JSON on attempt ${i}. Raw cleaned text shown above.);
-      // continue if retries allowed
+      console.warn(`[lrExtractor] Model returned unparsable/non-JSON on attempt ${i}. Raw cleaned text shown above.`);
     }
   }
 
   console.warn("[lrExtractor] Attempts exhausted — returning empty fields (no local fallback).");
-  // still print empties for consistency
-  try {
-    const empty = { truckNumber: "", from: "", to: "", weight: "", description: "", name: "" };
-    console.log("\n[lrExtractor OUTPUT - CHATGPT PARSED JSON] " + JSON.stringify(empty));
-    const excelRow = { ...empty, rawMessageSnippet: String(message || "").slice(0,200) };
-    console.log("[lrExtractor OUTPUT - EXCEL ROW] " + JSON.stringify(excelRow) + "\n");
-  } catch(e){}
   return { truckNumber: "", from: "", to: "", weight: "", description: "", name: "" };
 }
 
