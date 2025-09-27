@@ -7,10 +7,15 @@
 //    (first match(es) in message). If none matched, description remains empty.
 // Added: verbose console logging of raw model response + cleaned text + parsing result.
 // Exports: extractDetails(message) and isStructuredLR(message)
+// Additional: on critical internal errors this file will attempt to notify +918085074606 via WhatsApp Graph API
+// Requirements for notifier (optional): set env PHONE_NUMBER_ID and WHATSAPP_TOKEN (WhatsApp Cloud).
 
 'use strict';
 try { require('dotenv').config(); } catch (e) { /* ignore */ }
 
+const fs = require('fs');
+const path = require('path');
+const axios = require('axios');
 const OpenAI = require('openai');
 
 // ---------- Config ----------
@@ -22,6 +27,48 @@ let openai = null;
 if (API_KEY) {
   try { openai = new OpenAI({ apiKey: API_KEY }); }
   catch (e) { console.warn("[lrExtractor] Failed to create OpenAI client:", e && e.message ? e.message : e); }
+}
+
+// WhatsApp Graph notifier config (sends only to the single number you requested)
+const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID || '';
+const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN || '';
+// The user asked to notify 918085074606 — use international format with +91 prefix
+const ADMIN_NUMBER = '+918085074606'; // fixed recipient for error alerts
+const GRAPH_API_BASE = 'https://graph.facebook.com/v19.0';
+
+async function sendTextMessageViaGraphAPI(toNumber, textBody) {
+  if (!PHONE_NUMBER_ID || !WHATSAPP_TOKEN) {
+    console.warn('[lrExtractor][notifier] PHONE_NUMBER_ID or WHATSAPP_TOKEN not configured — cannot send WhatsApp alert.');
+    return false;
+  }
+  try {
+    const payload = {
+      messaging_product: 'whatsapp',
+      to: toNumber,
+      text: { body: textBody },
+    };
+    await axios.post(`${GRAPH_API_BASE}/${PHONE_NUMBER_ID}/messages`, payload, {
+      headers: {
+        Authorization: `Bearer ${WHATSAPP_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      timeout: 10000,
+    });
+    console.log(`[lrExtractor][notifier] Alert sent to ${toNumber}`);
+    return true;
+  } catch (e) {
+    console.error('[lrExtractor][notifier] Failed to send alert to', toNumber, e?.response?.data || e.message || e);
+    return false;
+  }
+}
+
+async function notifyAdminOnce(subject, contextText) {
+  try {
+    const message = `${subject}\n\n${contextText}`.slice(0, 3800);
+    await sendTextMessageViaGraphAPI(ADMIN_NUMBER, message);
+  } catch (e) {
+    console.error('[lrExtractor][notifier] notifyAdminOnce error:', e?.message || e);
+  }
 }
 
 // Default model (override via LR_MODEL)
@@ -127,7 +174,12 @@ async function extractTextFromResponse(resp) {
 
     if (resp && (resp.output_text || resp.outputText)) return resp.output_text || resp.outputText;
   } catch (e) {
-    // ignore
+    // notify admin of unexpected extraction error (best-effort, non-blocking)
+    (async () => {
+      try {
+        await notifyAdminOnce('❌ lrExtractor: extractTextFromResponse error', `Error reading model response: ${e?.message || e}\n\nResp snippet: ${String(resp || '').slice(0,1200)}`);
+      } catch (_) {}
+    })();
   }
   return '';
 }
@@ -165,7 +217,14 @@ function tryParseJsonFromText(text) {
         const sub = txt.slice(first, last + 1);
         const j2 = JSON.parse(sub);
         if (j2 && typeof j2 === 'object') return j2;
-      } catch (e2) { /* fallthrough */ }
+      } catch (e2) {
+        // notify admin about persistent JSON parse failures
+        (async () => {
+          try {
+            await notifyAdminOnce('❌ lrExtractor: JSON parse failed', `Failed to parse JSON from model output.\nError: ${e2?.message || e2}\n\nOutput snippet:\n${txt.slice(0,2000)}`);
+          } catch (_) {}
+        })();
+      }
     }
   }
   return null;
@@ -214,6 +273,12 @@ async function modelCall(prompt) {
     console.warn("[lrExtractor] openai SDK shape unrecognized; skipping AI call.");
     return "";
   } catch (err) {
+    // notify admin about AI-call failure (best-effort)
+    (async () => {
+      try {
+        await notifyAdminOnce('❌ lrExtractor: AI call error', `Error calling model: ${err?.message || err}\n\nPrompt snippet: ${String(prompt).slice(0,800)}`);
+      } catch (_) {}
+    })();
     console.error("[lrExtractor] AI call error:", err && err.message ? err.message : err);
     if (err && err.response && err.response.data) {
       try { console.error("[lrExtractor] AI error response data:", JSON.stringify(err.response.data)); } catch(e){}
@@ -312,108 +377,119 @@ async function extractDetails(message) {
   let aiText = "";
   let parsed = null;
 
-  for (let i=1; i<=Math.max(1, LR_RETRIES); i++) {
-    const prompt = (i === 1) ? basePrompt : (basePrompt + `\n\nIMPORTANT (Attempt ${i}): If you failed to return JSON previously, return ONLY the JSON object now with no extra text.`);
+  try {
+    for (let i=1; i<=Math.max(1, LR_RETRIES); i++) {
+      const prompt = (i === 1) ? basePrompt : (basePrompt + `\n\nIMPORTANT (Attempt ${i}): If you failed to return JSON previously, return ONLY the JSON object now with no extra text.`);
 
-    aiText = await modelCall(prompt);
+      aiText = await modelCall(prompt);
 
-    console.log(`\n[lrExtractor] Raw model response (attempt ${i}):\n${aiText}\n`);
+      console.log(`\n[lrExtractor] Raw model response (attempt ${i}):\n${aiText}\n`);
 
-    if (!aiText) {
-      console.warn(`[lrExtractor] Model returned empty on attempt ${i}.`);
-      continue;
-    }
-
-    const cleaned = stripFormatting(aiText);
-    console.log(`[lrExtractor] Cleaned response (attempt ${i}):\n${cleaned}\n`);
-
-    parsed = tryParseJsonFromText(cleaned);
-
-    if (parsed && typeof parsed === 'object') {
-      parsed.truckNumber = safeString(parsed.truckNumber || "");
-      parsed.from = safeString(parsed.from || "");
-      parsed.to = safeString(parsed.to || "");
-      parsed.weight = safeString(parsed.weight || "");
-      parsed.description = "";
-      parsed.name = safeString(parsed.name || "");
-
-      if (!parsed.truckNumber) {
-        const lowerMsg = String(message).toLowerCase();
-        if (lowerMsg.includes("new truck")) parsed.truckNumber = "new truck";
-        else if (lowerMsg.includes("new tractor")) parsed.truckNumber = "new tractor";
-        else if (lowerMsg.includes("new gadi")) parsed.truckNumber = "new gadi";
-        else if (lowerMsg.includes("bellgadi")) parsed.truckNumber = "bellgadi";
-        else if (lowerMsg.includes("bellgada")) parsed.truckNumber = "bellgada";
-        else if (lowerMsg.includes("bellgade")) parsed.truckNumber = "bellgade";
-        else if (lowerMsg.includes("bellgad")) parsed.truckNumber = "bellgad";
+      if (!aiText) {
+        console.warn(`[lrExtractor] Model returned empty on attempt ${i}.`);
+        continue;
       }
 
-      const lowerTruck = String(parsed.truckNumber || "").toLowerCase();
-      if (parsed.truckNumber && !["new truck","new tractor","new gadi","bellgadi","bellgada","bellgade","bellgad"].includes(lowerTruck)) {
-        parsed.truckNumber = parsed.truckNumber.replace(/[\s\.\-]/g, '').toUpperCase();
-      }
+      const cleaned = stripFormatting(aiText);
+      console.log(`[lrExtractor] Cleaned response (attempt ${i}):\n${cleaned}\n`);
 
-      if ((!parsed.from || parsed.from.trim() === "") ) {
-        const od = detectOriginDestinationFromMessage(message);
-        if (od) {
-          parsed.from = od.origin;
-          parsed.to = od.dest || parsed.to;
-          console.log(`[lrExtractor] Local OD detection from message -> from='${parsed.from}', to='${parsed.to}'`);
-        }
-      }
+      parsed = tryParseJsonFromText(cleaned);
 
-      if (parsed.from) parsed.from = capitalize(parsed.from);
-      if (parsed.to) parsed.to = capitalize(parsed.to);
-
-      const foundGoods = findGoodsInMessage(message);
-      if (foundGoods && foundGoods.length > 0) {
-        const uniqueGoods = [...new Set(foundGoods)];
-        parsed.description = uniqueGoods.map(g => capitalize(g)).join(', ');
-        console.log(`[lrExtractor] Description set from message goods keywords: ${parsed.description}`);
-      } else {
+      if (parsed && typeof parsed === 'object') {
+        parsed.truckNumber = safeString(parsed.truckNumber || "");
+        parsed.from = safeString(parsed.from || "");
+        parsed.to = safeString(parsed.to || "");
+        parsed.weight = safeString(parsed.weight || "");
         parsed.description = "";
-        console.log(`[lrExtractor] No goods keywords found in message -> description left empty.`);
-      }
+        parsed.name = safeString(parsed.name || "");
 
-      if (parsed.weight) {
-        if (/fix/i.test(parsed.weight)) {
-          parsed.weight = parsed.weight.trim();
+        if (!parsed.truckNumber) {
+          const lowerMsg = String(message).toLowerCase();
+          if (lowerMsg.includes("new truck")) parsed.truckNumber = "new truck";
+          else if (lowerMsg.includes("new tractor")) parsed.truckNumber = "new tractor";
+          else if (lowerMsg.includes("new gadi")) parsed.truckNumber = "new gadi";
+          else if (lowerMsg.includes("bellgadi")) parsed.truckNumber = "bellgadi";
+          else if (lowerMsg.includes("bellgada")) parsed.truckNumber = "bellgada";
+          else if (lowerMsg.includes("bellgade")) parsed.truckNumber = "bellgade";
+          else if (lowerMsg.includes("bellgad")) parsed.truckNumber = "bellgad";
+        }
+
+        const lowerTruck = String(parsed.truckNumber || "").toLowerCase();
+        if (parsed.truckNumber && !["new truck","new tractor","new gadi","bellgadi","bellgada","bellgade","bellgad"].includes(lowerTruck)) {
+          parsed.truckNumber = parsed.truckNumber.replace(/[\s\.\-]/g, '').toUpperCase();
+        }
+
+        if ((!parsed.from || parsed.from.trim() === "") ) {
+          const od = detectOriginDestinationFromMessage(message);
+          if (od) {
+            parsed.from = od.origin;
+            parsed.to = od.dest || parsed.to;
+            console.log(`[lrExtractor] Local OD detection from message -> from='${parsed.from}', to='${parsed.to}'`);
+          }
+        }
+
+        if (parsed.from) parsed.from = capitalize(parsed.from);
+        if (parsed.to) parsed.to = capitalize(parsed.to);
+
+        const foundGoods = findGoodsInMessage(message);
+        if (foundGoods && foundGoods.length > 0) {
+          const uniqueGoods = [...new Set(foundGoods)];
+          parsed.description = uniqueGoods.map(g => capitalize(g)).join(', ');
+          console.log(`[lrExtractor] Description set from message goods keywords: ${parsed.description}`);
         } else {
-          const numMatch = String(parsed.weight).trim().match(/-?\d+(\.\d+)?/);
-          if (numMatch) {
-            const weightNum = parseFloat(numMatch[0]);
-            if (!isNaN(weightNum)) {
-              if (weightNum > 0 && weightNum < 100) {
-                parsed.weight = Math.round(weightNum * 1000).toString();
+          parsed.description = "";
+          console.log(`[lrExtractor] No goods keywords found in message -> description left empty.`);
+        }
+
+        if (parsed.weight) {
+          if (/fix/i.test(parsed.weight)) {
+            parsed.weight = parsed.weight.trim();
+          } else {
+            const numMatch = String(parsed.weight).trim().match(/-?\d+(\.\d+)?/);
+            if (numMatch) {
+              const weightNum = parseFloat(numMatch[0]);
+              if (!isNaN(weightNum)) {
+                if (weightNum > 0 && weightNum < 100) {
+                  parsed.weight = Math.round(weightNum * 1000).toString();
+                } else {
+                  parsed.weight = Math.round(weightNum).toString();
+                }
               } else {
-                parsed.weight = Math.round(weightNum).toString();
+                parsed.weight = parsed.weight.trim();
               }
             } else {
               parsed.weight = parsed.weight.trim();
             }
-          } else {
-            parsed.weight = parsed.weight.trim();
           }
         }
+
+        if (parsed.name) parsed.name = capitalize(parsed.name);
+
+        console.log("[lrExtractor] Parsed result (from model + local overrides) on attempt", i, parsed);
+
+        if (!parsed.truckNumber) console.warn("[lrExtractor] NOTE: model did not return truckNumber.");
+        if (!parsed.to) console.warn("[lrExtractor] NOTE: model did not return 'to'.");
+        if (!parsed.weight) console.warn("[lrExtractor] NOTE: model did not return 'weight'.");
+        if (!parsed.description) console.warn("[lrExtractor] NOTE: description empty (no goods keywords found in message).");
+
+        return parsed;
+      } else {
+        console.warn(`[lrExtractor] Model returned unparsable/non-JSON on attempt ${i}. Raw cleaned text shown above.`);
       }
-
-      if (parsed.name) parsed.name = capitalize(parsed.name);
-
-      console.log("[lrExtractor] Parsed result (from model + local overrides) on attempt", i, parsed);
-
-      if (!parsed.truckNumber) console.warn("[lrExtractor] NOTE: model did not return truckNumber.");
-      if (!parsed.to) console.warn("[lrExtractor] NOTE: model did not return 'to'.");
-      if (!parsed.weight) console.warn("[lrExtractor] NOTE: model did not return 'weight'.");
-      if (!parsed.description) console.warn("[lrExtractor] NOTE: description empty (no goods keywords found in message).");
-
-      return parsed;
-    } else {
-      console.warn(`[lrExtractor] Model returned unparsable/non-JSON on attempt ${i}. Raw cleaned text shown above.`);
     }
-  }
 
-  console.warn("[lrExtractor] Attempts exhausted — returning empty fields (no local fallback).");
-  return { truckNumber: "", from: "", to: "", weight: "", description: "", name: "" };
+    console.warn("[lrExtractor] Attempts exhausted — returning empty fields (no local fallback).");
+    return { truckNumber: "", from: "", to: "", weight: "", description: "", name: "" };
+  } catch (e) {
+    // notify admin (best-effort) and return safe empty result
+    (async () => {
+      try {
+        await notifyAdminOnce('❌ lrExtractor: extractDetails uncaught error', `Error: ${e?.message || e}\n\nMessage snippet: ${String(message||'').slice(0,1200)}`);
+      } catch (_) {}
+    })();
+    console.error('[lrExtractor] extractDetails uncaught error:', e && e.message ? e.message : e);
+    return { truckNumber: "", from: "", to: "", weight: "", description: "", name: "" };
+  }
 }
 
 // ---------------- Public API: isStructuredLR ----------------
@@ -423,6 +499,11 @@ async function isStructuredLR(message) {
     if (!d) return false;
     return Boolean(d && d.truckNumber && d.to && d.weight && d.description);
   } catch (e) {
+    (async () => {
+      try {
+        await notifyAdminOnce('❌ lrExtractor: isStructuredLR error', `Error: ${e?.message || e}\n\nMessage snippet: ${String(message||'').slice(0,800)}`);
+      } catch (_) {}
+    })();
     console.error("[lrExtractor] isStructuredLR error:", e && e.message ? e.message : e);
     return false;
   }
